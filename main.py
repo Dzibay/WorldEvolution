@@ -1,66 +1,72 @@
 import json
+import sys
+import time
+from collections import Counter
+
 import numpy as np
 import pyvista as pv
 from vtkmodules.vtkRenderingCore import vtkCellPicker
-from collections import Counter
 
-# === 1. ЗАГРУЗКА ДАННЫХ ===
-
+# === 0. ДАННЫЕ БИОМОВ ===
 try:
     from biomes_properties import BIOME_DATA
 except ImportError:
-    print("Ошибка: не найден файл biome_properties.py!")
-    exit()
+    print("Ошибка: не найден файл biomes_properties.py!")
+    sys.exit(1)
 
-json_filename = "world_cells.json"
+# === 1. ЗАГРУЗКА КАРТЫ ЯЧЕЕК ===
+JSON_FILE = "world_cells.json"
 try:
-    with open(json_filename, "r") as f:
+    with open(JSON_FILE, "r", encoding="utf-8") as f:
         cells = json.load(f)
 except FileNotFoundError:
-    print(f"Ошибка: Файл {json_filename} не найден!")
-    exit()
+    print(f"Ошибка: файл {JSON_FILE} не найден!")
+    sys.exit(1)
 
 nx = max(c["i"] for c in cells) + 1
 ny = max(c["j"] for c in cells) + 1
 
-UNKNOWN_COLOR = (255, 0, 255)
-radius_earth = 6371.0
-elevation_exaggeration = 50.0
+# Исходные единицы: км/м. Перейдём в единый масштаб сцены (радиус Земли = 1.0).
+R_EARTH_KM = 6371.0
+SCALE = 1.0 / R_EARTH_KM  # 1.0 сцена = 6371 км в реальности
+ELEV_EXAG = 50.0  # вертикальное преувеличение (в разах, для POSITIVE высот)
 
-# === 2. ПРОЕКЦИЯ В 3D ===
-grid_points = np.zeros((nx, ny, 3))
+UNKNOWN_COLOR = (255, 0, 255)
+
+# === 2. ПРОЕКЦИЯ В 3D (радиус = 1.0) ===
+grid_points = np.zeros((nx, ny, 3), dtype=float)
 grid_colors = np.zeros((nx, ny, 3), dtype=np.uint8)
 cell_data_grid = np.full((nx, ny), None, dtype=object)
 
 for c in cells:
     i, j = c["i"], c["j"]
-    theta = (i / (nx - 1)) * 2 * np.pi
-    phi = np.pi / 2 - (j / (ny - 1)) * np.pi
-    r = radius_earth + (c["elevation_m"] / 1000.0) * elevation_exaggeration if c["elevation_m"] > 0 else radius_earth
+
+    # долгота/широта
+    theta = (i / (nx - 1)) * 2.0 * np.pi   # 0..2π
+    phi = np.pi / 2.0 - (j / (ny - 1)) * np.pi  # +π/2..-π/2
+
+    # базовый радиус = 1.0; добавляем высоту (только положительную) с преувеличением
+    elev_km = max(0.0, float(c.get("elevation_m", 0.0)) / 1000.0)
+    r = 1.0 + elev_km * ELEV_EXAG * SCALE
 
     x = r * np.cos(phi) * np.cos(theta)
     y = r * np.cos(phi) * np.sin(theta)
     z = r * np.sin(phi)
-    grid_points[i, j] = [x, y, z]
+    grid_points[i, j] = (x, y, z)
 
-    biome_name = c["biome"]
+    biome_name = c.get("biome", "Unknown")
     props = BIOME_DATA.get(biome_name)
 
-    # <<< ИЗМЕНЕНО: Исправление проблемы с нулевыми средними
-    # Мы должны объединить данные из BIOME_DATA (props) и world_cells.json (c)
-    
+    # цвет и объединённые свойства
     if props:
         grid_colors[i, j] = props["vis_color"]
-        # Сначала берем все свойства биома из 'props'
-        # Затем перезаписываем их 'c' (данные ячейки, как elevation_m)
-        merged_data = {**props, **c}
-        cell_data_grid[i, j] = merged_data
+        merged = {**props, **c}
+        cell_data_grid[i, j] = merged
     else:
-        # Если биом не найден, используем цвет по умолчанию и только данные 'c'
         grid_colors[i, j] = UNKNOWN_COLOR
         cell_data_grid[i, j] = c
 
-# ... (Код создания faces, points_flat и т.д. не изменился) ...
+# === 3. МЕШ ПОВЕРХНОСТИ СФЕРЫ ===
 faces = []
 for i in range(nx - 1):
     for j in range(ny - 1):
@@ -74,185 +80,317 @@ for i in range(nx - 1):
 points_flat = grid_points.reshape(-1, 3)
 faces_flat = np.hstack(faces)
 colors_flat = grid_colors.reshape(-1, 3)
+
 mesh = pv.PolyData(points_flat, faces=faces_flat)
-mesh.point_data['colors'] = colors_flat
+mesh.point_data["colors"] = colors_flat
 
+# === 4. ВИЗУАЛИЗАЦИЯ ===
+plotter = pv.Plotter(window_size=(1600, 1000))
+plotter.set_background("black")
+plotter.add_axes(interactive=False)
+plotter.add_mesh(mesh, scalars="colors", rgb=True, smooth_shading=True)
 
-# === 3. ВИЗУАЛИЗАЦИЯ ===
-plotter = pv.Plotter(window_size=[1600, 1000])
-plotter.set_background('black')
-plotter.add_axes()
-plotter.camera_position = 'xy'
-plotter.add_mesh(mesh, scalars='colors', rgb=True, smooth_shading=True)
-plotter.add_text("Зажми ПРОБЕЛ и тяни мышь — выделить область, отпустить — вычислить и показать", position="upper_left", font_size=12, color="gray")
+# HUD — создаём ОДИН раз
+hud_actor = plotter.add_text("Год: —", position="lower_left", font_size=10, color="white")
 
-picker = vtkCellPicker()
-picker.SetTolerance(0.005)
+# Информационная панель по клику — не пересоздаём каждый клик
+info_actor = plotter.add_text("", position="upper_right", font_size=10, color="white")
+try:
+    info_actor.SetInput("")  # убедимся, что можно обновлять
+except Exception:
+    pass
 
-# === 4. ПЕРЕМЕННЫЕ СОСТОЯНИЯ ===
-drag_start = None
-# <<< ИЗМЕНЕНО: Будем хранить список акторов (4 линии)
-highlight_actors = [] 
-current_text_actor = None
+# Стабилизация камеры и проектции
+plotter.camera_position = "yz"  # начальный ракурс
+plotter.enable_parallel_projection()
+plotter.camera.zoom(1.2)
 
-# === 5. ФУНКЦИЯ ДЛЯ СРЕДНИХ ===
+# Пикер для кликов
+click_picker = vtkCellPicker()
+click_picker.SetTolerance(0.002)
+
+# === 5. УТИЛИТЫ ДЛЯ ИНФО ===
 def summarize_region(i_min, i_max, j_min, j_max):
     selected = []
     for i in range(i_min, i_max + 1):
         for j in range(j_min, j_max + 1):
-            c = cell_data_grid[i % nx, j] # i % nx - позволяет "обернуться" вокруг глобуса
+            c = cell_data_grid[i % nx, j % ny]
             if c:
                 selected.append(c)
     if not selected:
         return "Нет данных"
 
-    # Эта функция теперь будет работать, т.к. 'c' содержит все ключи
-    def avg(key): return np.mean([c.get(key, 0) for c in selected if isinstance(c.get(key, 0), (int, float))])
-    
-    # <<< НАЧАЛО ИЗМЕНЕНИЯ
-    biomes = [c["biome"] for c in selected]
-    
-    # Считаем биомы и сразу сортируем по убыванию
-    biome_counts = Counter(biomes).most_common()
-    
-    # Берем топ-3
-    top_3_biomes = biome_counts[:3]
-    
-    # Форматируем список строк
-    biome_list = [f"{b} ({n})" for b, n in top_3_biomes]
-    
-    # Соединяем
-    biome_stats = ", ".join(biome_list)
-    
-    # Если всего уникальных биомов было больше 3, добавляем троеточие
-    if len(biome_counts) > 3:
-        biome_stats += ", ..."
-    # <<< КОНЕЦ ИЗМЕНЕНИЯ
+    def avg(key):
+        vals = [c.get(key, 0) for c in selected]
+        vals = [v for v in vals if isinstance(v, (int, float))]
+        return float(np.mean(vals)) if vals else 0.0
 
-    text = f"""--- Selected {len(selected)} cells ---
-        Biomes: {biome_stats}
+    biomes = [c.get("biome", "Unknown") for c in selected]
+    top_biomes = ", ".join([f"{b} ({n})" for b, n in Counter(biomes).most_common(3)])
 
-        Elevation: {avg('elevation_m'):.1f} m
-        Food (Veg): {avg('food_vegetal'):.2f}
-        Food (Animal): {avg('food_animal'):.2f}
-        Water: {avg('fresh_water'):.2f}
-        Wood: {avg('wood_yield'):.2f}
-        Stone: {avg('stone_yield'):.2f}
-        Ore: {avg('ore_yield'):.2f}
-        Habitability: {avg('habitability'):.2f}
-        Arable land: {avg('arable_land'):.2f}
-        Movement cost: {avg('movement_cost'):.2f}
-        """
+    text = (
+        f"--- Selected {len(selected)} cells ---\n"
+        f"Biomes: {top_biomes}\n\n"
+        f"Elevation: {avg('elevation_m'):.1f} m\n"
+        f"Food (Veg): {avg('food_vegetal'):.2f}\n"
+        f"Food (Animal): {avg('food_animal'):.2f}\n"
+        f"Water: {avg('fresh_water'):.2f}\n"
+        f"Wood: {avg('wood_yield'):.2f}\n"
+        f"Stone: {avg('stone_yield'):.2f}\n"
+        f"Ore: {avg('ore_yield'):.2f}\n"
+        f"Habitability: {avg('habitability'):.2f}\n"
+        f"Arable land: {avg('arable_land'):.2f}\n"
+        f"Movement cost: {avg('movement_cost'):.2f}\n"
+    )
     return text
 
-# === 6. ОБРАБОТЧИКИ МЫШИ (выделение с пробелом) ===
-space_pressed = False
+def get_cell_info(i, j):
+    c = cell_data_grid[i % nx, j % ny]
+    if not c:
+        return "Нет данных"
+    biome = c.get("biome", "Unknown")
+    h = c.get("elevation_m", 0)
+    habit = c.get("habitability", 0)
+    food = (c.get("food_vegetal", 0) + c.get("food_animal", 0)) / 2
+    water = c.get("fresh_water", 0)
+    return (
+        f"--- Клетка ({i},{j}) ---\n"
+        f"Биом: {biome}\n"
+        f"Высота: {h:.0f} м\n"
+        f"Пригодность: {habit:.2f}\n"
+        f"Еда: {food:.2f}\n"
+        f"Вода: {water:.2f}\n"
+    )
 
-def on_key_press(obj, event):
-    global space_pressed, drag_start
-    key = obj.GetKeySym()
-    
-    if key == "space" and not space_pressed:
-        space_pressed = True
-        
-        click_pos = plotter.iren.get_event_position()
-        picker.Pick(click_pos[0], click_pos[1], 0, plotter.renderer)
-        idx = picker.GetPointId()
-        
-        if idx < 0: 
-            space_pressed = False 
-            drag_start = None
+def get_group_info(entity):
+    info = f"--- {entity.stage.capitalize()} #{entity.id} ---\n"
+    info += f"Позиция: ({entity.i},{entity.j})\n"
+    info += f"Население: {int(entity.population)}\n"
+    info += f"Еда: {getattr(entity, 'food', 0.0):.1f}\n"
+    info += f"Технологии: {getattr(entity, 'tech', 0.0):.3f}\n"
+    info += f"Возраст: {getattr(entity, 'age', 0)}\n"
+    return info
+
+# === 6. ОБРАБОТКА КЛИКА — ИНФО О КЛЕТКЕ/ГРУППЕ ===
+def on_left_click(obj, event):
+    click_pos = plotter.iren.get_event_position()
+    click_picker.Pick(click_pos[0], click_pos[1], 0, plotter.renderer)
+    idx = click_picker.GetPointId()
+    if idx < 0:
+        return
+    i, j = idx // ny, idx % ny
+    pos = grid_points[i, j]
+
+    # Проверяем близость к актёрам групп
+    target_text = get_cell_info(i, j)
+    min_dist = 0.02  # порог близости для сцены с R=1.0
+    if active_groups:
+        for g in active_groups:
+            if g.id in group_actors:
+                gpos = np.array(group_actors[g.id].GetPosition())
+                if np.linalg.norm(gpos - pos) < min_dist:
+                    target_text = get_group_info(g)
+                    break
+
+    try:
+        info_actor.SetInput(target_text)
+    except Exception:
+        pass
+
+plotter.iren.add_observer("LeftButtonPressEvent", on_left_click)
+
+# === 7. СИМУЛЯЦИЯ ЧЕЛОВЕЧЕСТВА ===
+print("Запускаю симуляцию групп...")
+
+from simulation import HumanGroup, load_world
+
+from config import (
+    STARTING_CELL_COORDS,
+    STARTING_POPULATION,
+    SIMULATION_STEP_YEARS,
+)
+
+# Загружаем ресурсную карту мира для симуляции
+world_data = load_world()
+
+# Начальная группа
+active_groups = [HumanGroup(0, *STARTING_CELL_COORDS, STARTING_POPULATION)]
+
+# Отрисованные актёры (сферы) и линии пути
+group_actors = {}   # id -> actor
+group_paths = {}    # id -> tube actor
+actors_to_remove = []
+
+def grid_to_xyz(i, j, lift=0.0003):
+    """
+    Координата точки на поверхности (радиус=1.0) с маленьким приподнятием.
+    lift ~ 0.0003 ~= 2 км над местностью.
+    """
+    if 0 <= i < nx and 0 <= j < ny:
+        base = grid_points[i, j]
+        n = base / np.linalg.norm(base)
+        return base + n * lift
+    return np.zeros(3)
+
+# Создаём визуализацию начальных групп
+for g in active_groups:
+    pos = grid_to_xyz(g.i, g.j)
+    actor = plotter.add_mesh(
+        pv.Sphere(radius=0.005, center=pos),  # радиус в сцене R=1.0
+        color="red",
+        smooth_shading=True,
+    )
+    group_actors[g.id] = actor
+
+# === 8. ТРАЕКТОРИИ ===
+def update_group_path(g):
+    """Обновляет короткий «хвост» пути (последние ~10 точек)."""
+    path_points = g.get_path_points() if hasattr(g, "get_path_points") else []
+    if len(path_points) < 2:
+        return
+
+    recent = path_points[-10:]
+    coords = np.array([grid_to_xyz(i, j, lift=0.0003) for (i, j) in recent])
+
+    path_poly = pv.Spline(coords, n_points=len(recent) * 6)
+    tube = path_poly.tube(radius=0.001)
+
+    if g.id in group_paths:
+        try:
+            group_paths[g.id].mapper.SetInputData(tube)
+            group_paths[g.id].mapper.Update()
             return
+        except Exception:
+            try:
+                plotter.renderer.remove_actor(group_paths[g.id])
+            except Exception:
+                pass
+            group_paths.pop(g.id, None)
 
-        drag_start = (idx // ny, idx % ny)
+    actor = plotter.add_mesh(tube, color="orange", smooth_shading=True)
+    group_paths[g.id] = actor
 
-def on_key_release(obj, event):
-    # <<< ИЗМЕНЕНО: 'highlight_actor' -> 'highlight_actors'
-    global space_pressed, drag_start, highlight_actors, current_text_actor
-    key = obj.GetKeySym()
+def cleanup_actors():
+    """Безопасное удаление актёров вне важной части рендера."""
+    global actors_to_remove
+    if not actors_to_remove:
+        return
+    to_remove = actors_to_remove[:]
+    actors_to_remove = []
+    for act in to_remove:
+        try:
+            plotter.renderer.remove_actor(act)
+        except Exception:
+            pass
 
-    if key == "space" and space_pressed:
-        space_pressed = False 
-        
-        if drag_start is None:
-            return
+# === 9. ЦИКЛ СИМУЛЯЦИИ (ДИСКРЕТНЫЙ, В ГЛАВНОМ ПОТОКЕ) ===
+current_year = -100000
+last_step_time = time.time()
+update_interval_s = 1.0  # по умолчанию 1 секунда между шагами
+simulation_running = True
 
-        i1, j1 = drag_start
-        drag_start = None 
+def update_simulation():
+    """Один дискретный шаг симуляции с плавным движением."""
+    global current_year, hud_actor
 
-        click_pos = plotter.iren.get_event_position()
-        picker.Pick(click_pos[0], click_pos[1], 0, plotter.renderer)
-        idx = picker.GetPointId()
+    current_year += SIMULATION_STEP_YEARS
+    static_counter = getattr(update_simulation, "counter", 0)
 
-        # <<< ИЗМЕНЕНО: Очищаем старые линии при отмене
-        if idx < 0: 
-            if highlight_actors:
-                for act in highlight_actors:
-                    plotter.remove_actor(act)
-                highlight_actors = []
-            return
-            
-        i2, j2 = idx // ny, idx % ny
+    # перебор копии, чтобы можно было модифицировать active_groups
+    for g in list(active_groups):
+        # смерть сущности
+        if not g.alive:
+            if g.id in group_actors:
+                actors_to_remove.append(group_actors[g.id])
+                del group_actors[g.id]
+            if g.id in group_paths:
+                actors_to_remove.append(group_paths[g.id])
+                del group_paths[g.id]
+            active_groups.remove(g)
+            continue
 
-        i_min, i_max = sorted([i1, i2])
-        j_min, j_max = sorted([j1, j2])
-        summary = summarize_region(i_min, i_max, j_min, j_max)
+        # логический шаг
+        result = g.step(world_data)
 
-        # обновляем текст
-        if current_text_actor:
-            plotter.remove_actor(current_text_actor)
-        current_text_actor = plotter.add_text(summary, position="upper_right", font_size=10, color="white")
+        # образование племени (HumanGroup.step может вернуть Tribe)
+        try:
+            from simulation import Tribe  # локальный импорт, чтобы избежать циклических deps
+        except Exception:
+            Tribe = None
 
-        # <<< ИЗМЕНЕНО: Логика подсветки полностью переписана
-        
-        # Сначала удаляем старые линии
-        if highlight_actors:
-            for act in highlight_actors:
-                plotter.remove_actor(act)
-            highlight_actors = []
+        if Tribe is not None and isinstance(result, Tribe):
+            tribe_pos = grid_to_xyz(result.i, result.j, lift=0.0003)
+            tribe_actor = plotter.add_mesh(
+                pv.Sphere(radius=0.006, center=tribe_pos),
+                color="yellow",
+                smooth_shading=True,
+            )
+            group_actors[result.id] = tribe_actor
+            active_groups.append(result)
+            # старая группа считается погибшей в step(); удалим в следующем тике
+            continue
 
-        # Создаем 4 НОВЫХ линии, которые следуют по сетке
-        
-        # 1. Верхняя линия (вдоль j_min)
-        top_points = np.array([grid_points[i % nx, j_min] for i in range(i_min, i_max + 1)])
-        # 2. Нижняя линия (вдоль j_max)
-        bottom_points = np.array([grid_points[i % nx, j_max] for i in range(i_min, i_max + 1)])
-        # 3. Левая линия (вдоль i_min)
-        left_points = np.array([grid_points[i_min % nx, j] for j in range(j_min, j_max + 1)])
-        # 4. Правая линия (вдоль i_max)
-        right_points = np.array([grid_points[i_max % nx, j] for j in range(j_min, j_max + 1)])
+        # живые группы/племена — обновляем актёра
+        actor = group_actors.get(g.id)
+        if actor is None:
+            # восстановление (на случай пропуска)
+            pos = grid_to_xyz(g.i, g.j)
+            actor = plotter.add_mesh(
+                pv.Sphere(radius=0.005 if g.stage == "group" else 0.006, center=pos),
+                color="red" if g.stage == "group" else "yellow",
+                smooth_shading=True,
+            )
+            group_actors[g.id] = actor
 
-        # Собираем все 4 набора точек
-        all_edge_points = [top_points, bottom_points, left_points, right_points]
+        target_pos = grid_to_xyz(g.i, g.j, lift=0.0003)
+        old_pos = np.array(actor.GetPosition())
+        # плавное движение (25% к цели)
+        smooth_pos = old_pos + (target_pos - old_pos) * 0.25
+        actor.SetPosition(smooth_pos)
+        actor.prop.color = "yellow" if g.stage == "tribe" else "red"
 
-        for points in all_edge_points:
-            # Убедимся, что в линии есть хотя бы 2 точки
-            if len(points) < 2:
-                continue
-            
-            # 1. Создаем PolyData из точек
-            poly = pv.PolyData(points)
-            
-            # 2. Создаем "линии", соединяющие точки по порядку (0-1, 1-2, 2-3...)
-            # Это создает одну длинную ломаную линию (polyline)
-            line_indices = np.arange(len(points))
-            lines_array = np.hstack((len(points), line_indices))
-            poly.lines = lines_array
-            
-            # 3. Превращаем 1D-линию в 3D-"трубу", чтобы ее было видно
-            tube = poly.tube(radius=15.0) # Радиус можно настроить
-            
-            # 4. Добавляем "трубу" на сцену и сохраняем актора
-            actor = plotter.add_mesh(tube, color="magenta", smooth_shading=True)
-            highlight_actors.append(actor)
+        # обновляем короткий хвост пути раз в несколько тиков
+        if static_counter % 5 == 0:
+            update_group_path(g)
 
-# (Функция on_mouse_move_space удалена)
+    # HUD обновляем без пересоздания
+    if hud_actor is not None:
+        try:
+            hud_actor.SetInput(f"Год: {current_year}")
+        except Exception:
+            pass
 
-# === 7. ПОДКЛЮЧАЕМ СОБЫТИЯ ===
-# (Обработчик on_mouse_move_space удален)
-plotter.iren.add_observer("KeyPressEvent", on_key_press)
-plotter.iren.add_observer("KeyReleaseEvent", on_key_release)
+    update_simulation.counter = static_counter + 1
 
-# === 8. ЗАПУСК ===
+def on_render_callback(p):
+    """Таймер на основе рендер-цикла: строго дискретные шаги."""
+    global last_step_time
+    if not simulation_running:
+        return
+    now = time.time()
+    if now - last_step_time >= update_interval_s:
+        update_simulation()
+        cleanup_actors()
+        last_step_time = now
+
+plotter.add_on_render_callback(on_render_callback)
+
+# === 10. УПРАВЛЕНИЕ СКОРОСТЬЮ И ПАУЗОЙ ===
+def on_speed_key(obj, event):
+    global update_interval_s, simulation_running
+    key = obj.GetKeySym().lower()
+    if key in ("plus", "equal"):
+        update_interval_s = max(0.1, update_interval_s / 1.5)
+    elif key in ("minus", "underscore"):
+        update_interval_s = min(5.0, update_interval_s * 1.5)
+    elif key == "p":
+        simulation_running = not simulation_running
+        print("⏸ Пауза" if not simulation_running else "▶ Продолжение")
+    print(f"⏱ Шаг каждые {update_interval_s:.2f} сек.")
+
+plotter.iren.add_observer("KeyPressEvent", on_speed_key)
+
+# === 11. ПУСК ===
+plotter.reset_camera()
 plotter.show()
 print("Готово.")

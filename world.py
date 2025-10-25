@@ -46,7 +46,7 @@ print("Синхронизация завершена.")
 # ==========================
 # 2. Параметры клеток
 # ==========================
-CELL_PIXELS = 1
+CELL_PIXELS = 5
 nx, ny = w // CELL_PIXELS, h // CELL_PIXELS
 
 print(f"Размер сетки: {nx}x{ny} клеток ({CELL_PIXELS}x{CELL_PIXELS} пикселей на клетку)")
