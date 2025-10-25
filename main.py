@@ -193,7 +193,7 @@ def on_left_click(obj, event):
                     break
 
     try:
-        info_actor.SetInput(target_text)
+        safe_update_text(info_actor, target_text, corner_slot=3)
     except Exception:
         pass
 
@@ -283,6 +283,29 @@ def cleanup_actors():
         except Exception:
             pass
 
+def safe_update_text(actor, text: str, corner_slot: int = 0):
+    """Обновляет текст для CornerAnnotation, TextActor и tuple-обёрток."""
+    try:
+        # CornerAnnotation (старый HUD PyVista)
+        actor.SetText(corner_slot, text)
+        return
+    except AttributeError:
+        pass
+
+    try:
+        # Классический vtkTextActor
+        actor.SetInput(text)
+        return
+    except AttributeError:
+        pass
+
+    try:
+        # Обёртка (actor, prop)
+        if isinstance(actor, (tuple, list)) and hasattr(actor[0], "SetInput"):
+            actor[0].SetInput(text)
+    except Exception:
+        pass
+
 # === 9. ЦИКЛ СИМУЛЯЦИИ (ДИСКРЕТНЫЙ, В ГЛАВНОМ ПОТОКЕ) ===
 current_year = -100000
 last_step_time = time.time()
@@ -355,10 +378,7 @@ def update_simulation():
 
     # HUD обновляем без пересоздания
     if hud_actor is not None:
-        try:
-            hud_actor.SetInput(f"Год: {current_year}")
-        except Exception:
-            pass
+        safe_update_text(hud_actor, f"Год: {current_year}", corner_slot=0)
 
     update_simulation.counter = static_counter + 1
 
