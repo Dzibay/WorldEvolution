@@ -1,0 +1,45 @@
+def hex_to_rgb(hex_str):
+    """Конвертирует строку HEX (напр. '#fa9418') в RGB кортеж (250, 148, 24)."""
+    hex_str = hex_str.lstrip('#')
+    return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+
+RAW_BIOME_HEX_MAP = {
+    "Ocean": "#000070",
+    "Plains": "#8db360",
+    "Desert": "#fa9418",
+    "Mountains": "#606060",
+    "Forest": "#056621",
+    "Taiga": "#0b6659",
+    "Swamp": "#07f9b2",
+    "River": "#0000ff",
+    "Snowy Tundra": "#ffffff",
+    "Snowy Mountains": "#a0a0a0",
+    "Beach": "#fade55",
+    "Desert Hills": "#d25f12",
+    "Taiga Hills": "#163933",
+    "Jungle": "#537b09",
+    "Jungle Hills": "#2c4205",
+    "Jungle Edge": "#628b17",
+    "Snowy Beach": "#faf0c0",
+    "Giant Tree Taiga": "#596651",
+    "Giant Tree Taiga Hills": "#454f3e",
+    "Wooded Mountains": "#507050",
+    "Savanna": "#bdb25f",
+    "Savanna Plateau": "#a79d64",
+    "Badlands": "#d94515",
+    "Badlands Plateau": "#ca8c65",
+    "Warm Ocean": "#0000ac",
+    "Lukewarm Ocean": "#000090",
+    "Cold Ocean": "#202070",
+    "Deep Warm Ocean": "#000050",
+    "Deep Lukewarm Ocean": "#000040",
+    "Deep Cold Ocean": "#202038",
+    "Deep Frozen Ocean": "#404090",
+    "Sunflower Plains": "#b5db88",
+    "Desert Lakes": "#ffbc40",
+    "Flower Forest": "#2d8e49",
+    "Taiga Mountains": "#338e81",
+    "Modified Jungle Edge": "#8ab33f",
+    "Dark Forest Hills": "#687942",
+    "Snowy Taiga Mountains": "#597d72"
+}
