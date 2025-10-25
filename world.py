@@ -137,6 +137,11 @@ start_time = time.time()
 MIN_ELEVATION_METERS = -11000 # Марианская впадина
 MAX_ELEVATION_METERS = 8848  # Эверест
 
+# <<< ИЗМЕНЕНИЕ 1: Добавляем эту строку
+# Визуально определяем, что уровень моря (0м) на карте 
+# соответствует пикселю с яркостью ~90.
+SEA_LEVEL_RAW_VALUE = 90.0
+
 cells_json = []
 vis_image = np.zeros((ny, nx, 3), dtype=np.uint8) 
 
@@ -145,23 +150,20 @@ for i in range(nx):
         x0, y0 = i * CELL_PIXELS, j * CELL_PIXELS
         x1, y1 = x0 + CELL_PIXELS, y0 + CELL_PIXELS
         
-        # 1. Берем срез (2x2) с КАРТЫ БИОМОВ
+        # ... (шаги 1-4 не меняются) ...
         cell_biome_slice = biome_map[y0:y1, x0:x1]
-        
-        # 2. Находим доминирующий биом
         most_common_biome = Counter(cell_biome_slice.flatten()).most_common(1)[0][0]
-        
-        # 3. Берем срез (2x2) с КАРТY ВЫСОТ
         cell_elev_slice_raw = elevation_data_raw[y0:y1, x0:x1]
-        
-        # 4. Считаем среднюю "сырую" высоту (0-255)
         avg_elev_raw = float(np.mean(cell_elev_slice_raw))
         
         # 5. Масштабируем высоту в метры
+        
+        # <<< ИЗМЕНЕНИЕ 2: Заменяем старую строку np.interp на эту
+        # Используем НЕЛИНЕЙНОЕ масштабирование с 3 точками
         scaled_elev = np.interp(
             avg_elev_raw, 
-            [0, 255], 
-            [MIN_ELEVATION_METERS, MAX_ELEVATION_METERS]
+            [0, SEA_LEVEL_RAW_VALUE, 255], 
+            [MIN_ELEVATION_METERS, 0, MAX_ELEVATION_METERS]
         )
 
         # 6. Получаем доп. данные по БИОМУ (только цвет)
