@@ -1,20 +1,21 @@
 import json
 import sys
-import time
-from collections import Counter
-
 import numpy as np
-import pyvista as pv
-from vtkmodules.vtkRenderingCore import vtkCellPicker
 
-# === 0. ДАННЫЕ БИОМОВ ===
+import vispy.app
+vispy.app.use_app('glfw')
+
+from vispy import app, scene
+from vispy.scene.visuals import Text
+
+# === 0. Загрузка биомов ===
 try:
     from biomes_properties import BIOME_DATA
 except ImportError:
     print("Ошибка: не найден файл biomes_properties.py!")
     sys.exit(1)
 
-# === 1. ЗАГРУЗКА КАРТЫ ЯЧЕЕК ===
+# === 1. Загрузка карты ячеек ===
 JSON_FILE = "world_cells.json"
 try:
     with open(JSON_FILE, "r", encoding="utf-8") as f:
@@ -26,47 +27,33 @@ except FileNotFoundError:
 nx = max(c["i"] for c in cells) + 1
 ny = max(c["j"] for c in cells) + 1
 
-# Исходные единицы: км/м. Перейдём в единый масштаб сцены (радиус Земли = 1.0).
 R_EARTH_KM = 6371.0
-SCALE = 1.0 / R_EARTH_KM  # 1.0 сцена = 6371 км в реальности
-ELEV_EXAG = 50.0  # вертикальное преувеличение (в разах, для POSITIVE высот)
-
+SCALE = 1.0 / R_EARTH_KM
+ELEV_EXAG = 50.0  # преувеличение рельефа
 UNKNOWN_COLOR = (255, 0, 255)
 
-# === 2. ПРОЕКЦИЯ В 3D (радиус = 1.0) ===
-grid_points = np.zeros((nx, ny, 3), dtype=float)
-grid_colors = np.zeros((nx, ny, 3), dtype=np.uint8)
-cell_data_grid = np.full((nx, ny), None, dtype=object)
+# === 2. Сферическая сетка ===
+points = np.zeros((nx, ny, 3), dtype=np.float32)
+colors = np.zeros((nx, ny, 4), dtype=np.float32)
 
 for c in cells:
     i, j = c["i"], c["j"]
-
-    # долгота/широта
-    theta = (i / (nx - 1)) * 2.0 * np.pi   # 0..2π
-    phi = np.pi / 2.0 - (j / (ny - 1)) * np.pi  # +π/2..-π/2
-
-    # базовый радиус = 1.0; добавляем высоту (только положительную) с преувеличением
-    elev_km = max(0.0, float(c.get("elevation_m", 0.0)) / 1000.0)
-    r = 1.0 + elev_km * ELEV_EXAG * SCALE
+    theta = (i / (nx - 1)) * 2.0 * np.pi
+    phi = np.pi / 2.0 - (j / (ny - 1)) * np.pi
+    elev_km = float(c.get("elevation_m", 0.0)) / 1000.0
+    r = 1.0
 
     x = r * np.cos(phi) * np.cos(theta)
     y = r * np.cos(phi) * np.sin(theta)
     z = r * np.sin(phi)
-    grid_points[i, j] = (x, y, z)
+    points[i, j] = (x, y, z)
 
-    biome_name = c.get("biome", "Unknown")
-    props = BIOME_DATA.get(biome_name)
+    biome = c.get("biome", "Unknown")
+    props = BIOME_DATA.get(biome)
+    col = props["vis_color"] if props else UNKNOWN_COLOR
+    colors[i, j] = [col[0]/255, col[1]/255, col[2]/255, 1.0]
 
-    # цвет и объединённые свойства
-    if props:
-        grid_colors[i, j] = props["vis_color"]
-        merged = {**props, **c}
-        cell_data_grid[i, j] = merged
-    else:
-        grid_colors[i, j] = UNKNOWN_COLOR
-        cell_data_grid[i, j] = c
-
-# === 3. МЕШ ПОВЕРХНОСТИ СФЕРЫ ===
+# === 3. Генерация треугольников для меша ===
 faces = []
 for i in range(nx - 1):
     for j in range(ny - 1):
@@ -74,343 +61,302 @@ for i in range(nx - 1):
         p1 = (i + 1) * ny + j
         p2 = (i + 1) * ny + (j + 1)
         p3 = i * ny + (j + 1)
-        faces.append([3, p0, p1, p2])
-        faces.append([3, p0, p2, p3])
+        faces.append((p0, p1, p2))
+        faces.append((p0, p2, p3))
+faces = np.array(faces, dtype=np.uint32)
 
-points_flat = grid_points.reshape(-1, 3)
-faces_flat = np.hstack(faces)
-colors_flat = grid_colors.reshape(-1, 3)
+verts = points.reshape(-1, 3)
+cols = colors.reshape(-1, 4)
 
-mesh = pv.PolyData(points_flat, faces=faces_flat)
-mesh.point_data["colors"] = colors_flat
+# === 4. Создание сцены ===
+canvas = scene.SceneCanvas(keys="interactive", bgcolor="black", show=True, size=(1600, 1000))
+view = canvas.central_widget.add_view()
+view.camera = scene.cameras.TurntableCamera(fov=45, azimuth=0, elevation=30, distance=3)
 
-# === 4. ВИЗУАЛИЗАЦИЯ ===
-plotter = pv.Plotter(window_size=(1600, 1000))
-plotter.set_background("black")
-plotter.add_axes(interactive=False)
-plotter.add_mesh(mesh, scalars="colors", rgb=True, smooth_shading=True)
-
-# HUD — создаём ОДИН раз
-hud_actor = plotter.add_text("Год: —", position="lower_left", font_size=10, color="white")
-
-# Информационная панель по клику — не пересоздаём каждый клик
-info_actor = plotter.add_text("", position="upper_right", font_size=10, color="white")
-try:
-    info_actor.SetInput("")  # убедимся, что можно обновлять
-except Exception:
-    pass
-
-# Стабилизация камеры и проектции
-plotter.camera_position = "yz"  # начальный ракурс
-plotter.enable_parallel_projection()
-plotter.camera.zoom(1.2)
-
-# Пикер для кликов
-click_picker = vtkCellPicker()
-click_picker.SetTolerance(0.002)
-
-# === 5. УТИЛИТЫ ДЛЯ ИНФО ===
-def summarize_region(i_min, i_max, j_min, j_max):
-    selected = []
-    for i in range(i_min, i_max + 1):
-        for j in range(j_min, j_max + 1):
-            c = cell_data_grid[i % nx, j % ny]
-            if c:
-                selected.append(c)
-    if not selected:
-        return "Нет данных"
-
-    def avg(key):
-        vals = [c.get(key, 0) for c in selected]
-        vals = [v for v in vals if isinstance(v, (int, float))]
-        return float(np.mean(vals)) if vals else 0.0
-
-    biomes = [c.get("biome", "Unknown") for c in selected]
-    top_biomes = ", ".join([f"{b} ({n})" for b, n in Counter(biomes).most_common(3)])
-
-    text = (
-        f"--- Selected {len(selected)} cells ---\n"
-        f"Biomes: {top_biomes}\n\n"
-        f"Elevation: {avg('elevation_m'):.1f} m\n"
-        f"Food (Veg): {avg('food_vegetal'):.2f}\n"
-        f"Food (Animal): {avg('food_animal'):.2f}\n"
-        f"Water: {avg('fresh_water'):.2f}\n"
-        f"Wood: {avg('wood_yield'):.2f}\n"
-        f"Stone: {avg('stone_yield'):.2f}\n"
-        f"Ore: {avg('ore_yield'):.2f}\n"
-        f"Habitability: {avg('habitability'):.2f}\n"
-        f"Arable land: {avg('arable_land'):.2f}\n"
-        f"Movement cost: {avg('movement_cost'):.2f}\n"
-    )
-    return text
-
-def get_cell_info(i, j):
-    c = cell_data_grid[i % nx, j % ny]
-    if not c:
-        return "Нет данных"
-    biome = c.get("biome", "Unknown")
-    h = c.get("elevation_m", 0)
-    habit = c.get("habitability", 0)
-    food = (c.get("food_vegetal", 0) + c.get("food_animal", 0)) / 2
-    water = c.get("fresh_water", 0)
-    return (
-        f"--- Клетка ({i},{j}) ---\n"
-        f"Биом: {biome}\n"
-        f"Высота: {h:.0f} м\n"
-        f"Пригодность: {habit:.2f}\n"
-        f"Еда: {food:.2f}\n"
-        f"Вода: {water:.2f}\n"
-    )
-
-def get_group_info(entity):
-    info = f"--- {entity.stage.capitalize()} #{entity.id} ---\n"
-    info += f"Позиция: ({entity.i},{entity.j})\n"
-    info += f"Население: {int(entity.population)}\n"
-    info += f"Еда: {getattr(entity, 'food', 0.0):.1f}\n"
-    info += f"Технологии: {getattr(entity, 'tech', 0.0):.3f}\n"
-    info += f"Возраст: {getattr(entity, 'age', 0)}\n"
-    return info
-
-# === 6. ОБРАБОТКА КЛИКА — ИНФО О КЛЕТКЕ/ГРУППЕ ===
-def on_left_click(obj, event):
-    click_pos = plotter.iren.get_event_position()
-    click_picker.Pick(click_pos[0], click_pos[1], 0, plotter.renderer)
-    idx = click_picker.GetPointId()
-    if idx < 0:
-        return
-    i, j = idx // ny, idx % ny
-    pos = grid_points[i, j]
-
-    # Проверяем близость к актёрам групп
-    target_text = get_cell_info(i, j)
-    min_dist = 0.02  # порог близости для сцены с R=1.0
-    if active_groups:
-        for g in active_groups:
-            if g.id in group_actors:
-                gpos = np.array(group_actors[g.id].GetPosition())
-                if np.linalg.norm(gpos - pos) < min_dist:
-                    target_text = get_group_info(g)
-                    break
-
-    try:
-        safe_update_text(info_actor, target_text, corner_slot=3)
-    except Exception:
-        pass
-
-plotter.iren.add_observer("LeftButtonPressEvent", on_left_click)
-
-# === 7. СИМУЛЯЦИЯ ЧЕЛОВЕЧЕСТВА ===
-print("Запускаю симуляцию групп...")
-
-from simulation import HumanGroup, load_world
-
-from config import (
-    STARTING_CELL_COORDS,
-    STARTING_POPULATION,
-    SIMULATION_STEP_YEARS,
+# Меш Земли
+earth_mesh = scene.visuals.Mesh(
+    vertices=verts,
+    faces=faces,
+    vertex_colors=cols,
+    shading='smooth',
+    parent=view.scene
 )
 
-# Загружаем ресурсную карту мира для симуляции
-world_data = load_world()
+# === 5. Группы (красные точки) ===
+from simulation import HumanGroup, load_world
+from config import STARTING_CELL_COORDS, STARTING_POPULATION, SIMULATION_STEP_YEARS
 
-# Начальная группа
+world_data = load_world()
 active_groups = [HumanGroup(0, *STARTING_CELL_COORDS, STARTING_POPULATION)]
 
-# Отрисованные актёры (сферы) и линии пути
-group_actors = {}   # id -> actor
-group_paths = {}    # id -> tube actor
-actors_to_remove = []
+group_markers = scene.visuals.Markers(parent=view.scene)
+group_markers.set_data(np.array([[0, 0, 1]]), face_color='red', size=10)
 
-def grid_to_xyz(i, j, lift=0.0003):
-    """
-    Координата точки на поверхности (радиус=1.0) с маленьким приподнятием.
-    lift ~ 0.0003 ~= 2 км над местностью.
-    """
-    if 0 <= i < nx and 0 <= j < ny:
-        base = grid_points[i, j]
-        n = base / np.linalg.norm(base)
-        return base + n * lift
-    return np.zeros(3)
+def grid_to_xyz(i, j, lift=0.002):
+    base = points[i % nx, j % ny]
+    n = base / np.linalg.norm(base)
+    return base + n * lift
 
-# Создаём визуализацию начальных групп
-for g in active_groups:
-    pos = grid_to_xyz(g.i, g.j)
-    actor = plotter.add_mesh(
-        pv.Sphere(radius=0.005, center=pos),  # радиус в сцене R=1.0
-        color="red",
-        smooth_shading=True,
+# === 6. HUD (год) ===
+hud = Text("Год: —", 
+           parent=canvas.scene, 
+           anchor_x='left',   # ← выравнивание по левому краю
+           anchor_y='bottom',
+           color='white')
+hud.font_size = 20
+hud.pos = (0, 0)
+
+# === 7. Информационное окно (по клику) ===
+def compute_ray_from_click(view, canvas, pos):
+    """
+    Устойчивый рэйкаст для TurntableCamera:
+    - направлен точно к center
+    - без завала/скоса при любом повороте/зуме
+    """
+    import numpy as np
+
+    cam = view.camera
+    W, H = canvas.size
+    # экран -> NDC
+    x_ndc = (2.0 * pos[0] / W) - 1.0
+    y_ndc = 1.0 - (2.0 * pos[1] / H)
+
+    fov = np.deg2rad(cam.fov)
+    aspect = W / H
+
+    # 1) позиция камеры из параметров turntable
+    theta = np.deg2rad(cam.azimuth)
+    phi   = np.deg2rad(cam.elevation)
+    r     = cam.distance
+    cam_pos = cam.center + r * np.array([
+        np.cos(phi) * np.sin(theta),
+        -np.cos(phi) * np.cos(theta),
+        np.sin(phi)
+    ], dtype=np.float32)
+
+    # 2) базис камеры из center/pos
+    forward = cam.center - cam_pos
+    forward /= np.linalg.norm(forward)
+
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    # если почти смотрим вдоль world_up — возьмём запасной "вверх"
+    if abs(np.dot(forward, world_up)) > 0.98:
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    # ВНИМАНИЕ на порядок кроссов, чтобы "право" совпадало с экраном
+    right = np.cross(forward, world_up); right /= np.linalg.norm(right)
+    up    = np.cross(right,  forward);   up    /= np.linalg.norm(up)
+
+    # 3) плоскость проекции
+    half_h = np.tan(fov / 2.0)
+    half_w = aspect * half_h
+
+    # 4) направление луча
+    dir_world = forward + right * (x_ndc * half_w) + up * (y_ndc * half_h)
+    dir_world /= np.linalg.norm(dir_world)
+
+    return cam_pos.astype(np.float32), dir_world.astype(np.float32)
+
+info_box = Text(
+    '', 
+    parent=canvas.scene,
+    anchor_x='left',
+    anchor_y='bottom',
+    color='white'
+)
+info_box.font_size = 16
+info_box.pos = (0, 50)
+
+
+def get_cell_info(i, j):
+    """Возвращает подробную информацию о клетке (по координатам i,j)."""
+    c = next((cell for cell in cells if cell["i"] == i and cell["j"] == j), None)
+    if not c:
+        return f"❌ Клетка ({i},{j}) не найдена."
+
+    biome = c.get("biome", "Unknown")
+    elev = c.get("elevation_m", 0.0)
+
+    # 🔹 Достаём характеристики из BIOME_DATA
+    props = BIOME_DATA.get(biome, {})
+    fresh_water = props.get("fresh_water", 0)
+    food_vegetal = props.get("food_vegetal", 0)
+    food_animal = props.get("food_animal", 0)
+    wood = props.get("wood_yield", 0)
+    stone = props.get("stone_yield", 0)
+    ore = props.get("ore_yield", 0)
+    habit = props.get("habitability", 0)
+    arable = props.get("arable_land", 0)
+    move_cost = props.get("movement_cost", 0)
+    is_ocean = props.get("is_ocean", False)
+    is_fresh = props.get("is_fresh_water", False)
+
+    avg_food = (food_vegetal + food_animal) / 2
+
+    # --- Форматированный вывод ---
+    lines = [
+        f"--- Клетка ({i},{j}) ---",
+        f"Биом: {biome}",
+        f"Высота: {elev:.0f} м",
+        "",
+        f"Пригодность для жизни: {habit:.2f}",
+        f"Пригодность для земледелия: {arable:.2f}",
+        f"Стоимость передвижения: {move_cost:.2f}",
+        "",
+        f"Вода (пресная): {fresh_water:.2f}{' 💧' if is_fresh else ''}",
+        f"Еда: {avg_food:.2f} (средняя)",
+        f"     растительная {food_vegetal:.2f},",
+        f"     животная {food_animal:.2f},",
+        f"Ресурсы:",
+        f"  Древесина: {wood:.2f}",
+        f"  Камень: {stone:.2f}",
+        f"  Руда: {ore:.2f}",
+    ]
+    return "\n".join(lines)
+
+
+def get_group_info(entity):
+    return (
+        f"--- {entity.stage.capitalize()} #{entity.id} ---\n"
+        f"Позиция: ({entity.i},{entity.j})\n"
+        f"Население: {int(entity.population)}\n"
+        f"Еда: {getattr(entity, 'food', 0):.1f}\n"
+        f"Технологии: {getattr(entity, 'tech', 0):.3f}\n"
+        f"Возраст: {getattr(entity, 'age', 0)}"
     )
-    group_actors[g.id] = actor
 
-# === 8. ТРАЕКТОРИИ ===
-def update_group_path(g):
-    """Обновляет короткий «хвост» пути (последние ~10 точек)."""
-    path_points = g.get_path_points() if hasattr(g, "get_path_points") else []
-    if len(path_points) < 2:
+# === Добавим глобальный маркер для визуализации точки клика ===
+click_marker = scene.visuals.Markers(parent=view.scene)
+click_marker.set_data(np.array([[0, 0, 0]]), face_color='yellow', size=10)
+
+@canvas.events.mouse_press.connect
+def on_mouse_click(event):
+    """При клике мышью показываем информацию о ближайшей клетке или объекте."""
+    if event.button != 1:
         return
 
-    recent = path_points[-10:]
-    coords = np.array([grid_to_xyz(i, j, lift=0.0003) for (i, j) in recent])
+    pos = event.pos
+    ray_origin, ray_dir = compute_ray_from_click(view, canvas, pos)
 
-    path_poly = pv.Spline(coords, n_points=len(recent) * 6)
-    tube = path_poly.tube(radius=0.001)
+    # === 1. Пересечение луча со сферой ===
+    R = float(np.linalg.norm(points[0, 0]))  # радиус сферы из меша
+    # R — радиус сферы (у тебя уже есть)
+    a = np.dot(ray_dir, ray_dir)               # =1, но пусть будет общее
+    b = 2.0 * np.dot(ray_origin, ray_dir)
+    c = np.dot(ray_origin, ray_origin) - R*R
+    delta = b*b - 4*a*c
+    if delta < 0:
+        print("❌ Промах"); return
 
-    if g.id in group_paths:
-        try:
-            group_paths[g.id].mapper.SetInputData(tube)
-            group_paths[g.id].mapper.Update()
-            return
-        except Exception:
-            try:
-                plotter.renderer.remove_actor(group_paths[g.id])
-            except Exception:
-                pass
-            group_paths.pop(g.id, None)
+    sqrt_delta = np.sqrt(delta)
+    t_candidates = [t for t in ((-b - sqrt_delta)/(2*a), (-b + sqrt_delta)/(2*a)) if t > 0]
+    if not t_candidates:
+        print("❌ Пересечения позади камеры"); return
 
-    actor = plotter.add_mesh(tube, color="orange", smooth_shading=True)
-    group_paths[g.id] = actor
+    t = min(t_candidates)  # ближайшая точка ВПЕРЕДИ камеры
+    hit_point = ray_origin + t * ray_dir
+    x, y, z = hit_point
 
-def cleanup_actors():
-    """Безопасное удаление актёров вне важной части рендера."""
-    global actors_to_remove
-    if not actors_to_remove:
-        return
-    to_remove = actors_to_remove[:]
-    actors_to_remove = []
-    for act in to_remove:
-        try:
-            plotter.renderer.remove_actor(act)
-        except Exception:
-            pass
+    # === 3. Конвертация в сферические координаты ===
+    theta = np.arctan2(y, x)
+    if theta < 0:
+        theta += 2*np.pi
+    phi = np.arctan2(z, np.sqrt(x*x + y*y))
 
-def safe_update_text(actor, text: str, corner_slot: int = 0):
-    """Обновляет текст для CornerAnnotation, TextActor и tuple-обёрток."""
-    try:
-        # CornerAnnotation (старый HUD PyVista)
-        actor.SetText(corner_slot, text)
-        return
-    except AttributeError:
-        pass
+    i = int(np.rint(theta / (2*np.pi) * (nx - 1))) % nx
+    j = int(np.rint((np.pi/2 - phi) / np.pi * (ny - 1)))
+    j = int(np.clip(j, 0, ny - 1))
 
-    try:
-        # Классический vtkTextActor
-        actor.SetInput(text)
-        return
-    except AttributeError:
-        pass
+    # === 5. Обновляем маркер точки клика ===
+    # Поднимаем точку на 0.5% радиуса над поверхностью
+    lift = 0.005 * R  # 0.5% радиуса (можно изменить)
+    n = hit_point / np.linalg.norm(hit_point)  # нормаль наружу
+    hit_lifted = hit_point + n * lift
 
-    try:
-        # Обёртка (actor, prop)
-        if isinstance(actor, (tuple, list)) and hasattr(actor[0], "SetInput"):
-            actor[0].SetInput(text)
-    except Exception:
-        pass
+    click_marker.set_data(np.array([hit_lifted]), face_color='yellow', size=12)
 
-# === 9. ЦИКЛ СИМУЛЯЦИИ (ДИСКРЕТНЫЙ, В ГЛАВНОМ ПОТОКЕ) ===
+    # === 6. Информация о клетке ===
+    text = get_cell_info(i, j)
+
+    # Проверяем наличие группы поблизости
+    min_dist = 0.01
+    for g in active_groups:
+        pos_g = grid_to_xyz(g.i, g.j)
+        if np.linalg.norm(pos_g - points[i, j]) < min_dist:
+            text = get_group_info(g)
+            break
+
+    info_box.text = text
+
+
+# === 8. Симуляция ===
 current_year = -100000
-last_step_time = time.time()
-update_interval_s = 1.0  # по умолчанию 1 секунда между шагами
 simulation_running = True
+update_interval_s = 0.5
 
-def update_simulation():
-    """Один дискретный шаг симуляции с плавным движением."""
-    global current_year, hud_actor
+def update_simulation(event):
+    global current_year
+    if not simulation_running:
+        return
 
     current_year += SIMULATION_STEP_YEARS
-    static_counter = getattr(update_simulation, "counter", 0)
+    hud.text = f"Год: {current_year}"
 
-    # перебор копии, чтобы можно было модифицировать active_groups
+    new_entities = []
+    positions = []
+    colors = []
+
     for g in list(active_groups):
-        # смерть сущности
         if not g.alive:
-            if g.id in group_actors:
-                actors_to_remove.append(group_actors[g.id])
-                del group_actors[g.id]
-            if g.id in group_paths:
-                actors_to_remove.append(group_paths[g.id])
-                del group_paths[g.id]
             active_groups.remove(g)
             continue
 
-        # логический шаг
-        result = g.step(world_data)
+        result = g.step(world_data, debug=True)
 
-        # образование племени (HumanGroup.step может вернуть Tribe)
+        # Создание племени
         try:
-            from simulation import Tribe  # локальный импорт, чтобы избежать циклических deps
+            from simulation import Tribe
+            if isinstance(result, Tribe):
+                print(f"➡ Группа #{g.id} создала племя #{result.id} ({result.i},{result.j})")
+                new_entities.append(result)
+                if g in active_groups:
+                    active_groups.remove(g)
+                continue
         except Exception:
-            Tribe = None
+            pass
 
-        if Tribe is not None and isinstance(result, Tribe):
-            tribe_pos = grid_to_xyz(result.i, result.j, lift=0.0003)
-            tribe_actor = plotter.add_mesh(
-                pv.Sphere(radius=0.006, center=tribe_pos),
-                color="yellow",
-                smooth_shading=True,
-            )
-            group_actors[result.id] = tribe_actor
-            active_groups.append(result)
-            # старая группа считается погибшей в step(); удалим в следующем тике
-            continue
+        pos = grid_to_xyz(g.i, g.j)
+        positions.append(pos)
+        if getattr(g, "stage", "group") == "tribe":
+            colors.append((1.0, 1.0, 0.0, 1.0))
+        else:
+            colors.append((1.0, 0.0, 0.0, 1.0))
 
-        # живые группы/племена — обновляем актёра
-        actor = group_actors.get(g.id)
-        if actor is None:
-            # восстановление (на случай пропуска)
-            pos = grid_to_xyz(g.i, g.j)
-            actor = plotter.add_mesh(
-                pv.Sphere(radius=0.005 if g.stage == "group" else 0.006, center=pos),
-                color="red" if g.stage == "group" else "yellow",
-                smooth_shading=True,
-            )
-            group_actors[g.id] = actor
+    if new_entities:
+        active_groups.extend(new_entities)
 
-        target_pos = grid_to_xyz(g.i, g.j, lift=0.0003)
-        old_pos = np.array(actor.GetPosition())
-        # плавное движение (25% к цели)
-        smooth_pos = old_pos + (target_pos - old_pos) * 0.25
-        actor.SetPosition(smooth_pos)
-        actor.prop.color = "yellow" if g.stage == "tribe" else "red"
+    if positions:
+        group_markers.set_data(np.array(positions), face_color=np.array(colors), size=10)
 
-        # обновляем короткий хвост пути раз в несколько тиков
-        if static_counter % 5 == 0:
-            update_group_path(g)
+# === 9. Таймер ===
+timer = app.Timer(interval=update_interval_s, connect=update_simulation, start=True)
 
-    # HUD обновляем без пересоздания
-    if hud_actor is not None:
-        safe_update_text(hud_actor, f"Год: {current_year}", corner_slot=0)
-
-    update_simulation.counter = static_counter + 1
-
-def on_render_callback(p):
-    """Таймер на основе рендер-цикла: строго дискретные шаги."""
-    global last_step_time
-    if not simulation_running:
-        return
-    now = time.time()
-    if now - last_step_time >= update_interval_s:
-        update_simulation()
-        cleanup_actors()
-        last_step_time = now
-
-plotter.add_on_render_callback(on_render_callback)
-
-# === 10. УПРАВЛЕНИЕ СКОРОСТЬЮ И ПАУЗОЙ ===
-def on_speed_key(obj, event):
-    global update_interval_s, simulation_running
-    key = obj.GetKeySym().lower()
-    if key in ("plus", "equal"):
-        update_interval_s = max(0.1, update_interval_s / 1.5)
-    elif key in ("minus", "underscore"):
-        update_interval_s = min(5.0, update_interval_s * 1.5)
-    elif key == "p":
+# === 10. Управление ===
+@canvas.events.key_press.connect
+def on_key(event):
+    global simulation_running, update_interval_s
+    if event.key == 'P':
         simulation_running = not simulation_running
         print("⏸ Пауза" if not simulation_running else "▶ Продолжение")
-    print(f"⏱ Шаг каждые {update_interval_s:.2f} сек.")
+    elif event.key in ['+', '=']:
+        update_interval_s = max(0.05, update_interval_s / 1.5)
+        timer.interval = update_interval_s
+        print(f"⏱ Интервал: {update_interval_s:.2f} сек")
+    elif event.key in ['-', '_']:
+        update_interval_s = min(5.0, update_interval_s * 1.5)
+        timer.interval = update_interval_s
+        print(f"⏱ Интервал: {update_interval_s:.2f} сек")
 
-plotter.iren.add_observer("KeyPressEvent", on_speed_key)
-
-# === 11. ПУСК ===
-plotter.reset_camera()
-plotter.show()
-print("Готово.")
+# === 11. Запуск ===
+if __name__ == "__main__":
+    app.run()
