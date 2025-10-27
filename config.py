@@ -1,18 +1,17 @@
-# config.py
 # Параметры симуляции
-
 # --- Временные ---
-START_YEAR = -100000  # 100,000 лет до н.э.
+START_YEAR = -10000  # 10,000 лет до н.э.
 SIMULATION_STEP_YEARS = 10 # 1 шаг = 10 лет для ускорения
 END_YEAR = 2024
 CHECKPOINT_INTERVAL = 100 # Сохранять состояние каждые 100 лет (в headless)
 
 # --- Стартовые ---
 # Координаты (i, j) для старта в Африке (нужно найти на вашей карте)
-STARTING_CELL_COORDS = (420, 160) # Пример, замените на реальные
+STARTING_CELL_COORDS = (420, 170) # Пример, замените на реальные
 STARTING_POPULATION = 1000
 
 # --- Биология и Демография ---
+CARRYING_CAPACITY_FACTOR = 5000
 FOOD_WASTAGE_RATE = 0.1 # 10% еды портится
 BIRTH_RATE_BASE = 0.03 # 3% в год при идеальных условиях
 DEATH_RATE_BASE = 0.02 # 2% в год (старость, болезни)
@@ -38,9 +37,9 @@ STATE_MERGE_TECH_THRESHOLD = 0.3
 
 # --- Технологии ---
 # Шанс на "прорыв" в технологии за шаг (на группу)
-TECH_DISCOVERY_CHANCE_BASE = 0.001
+TECH_DISCOVERY_CHANCE_BASE = 0.5
 # Как сильно плотность населения влияет на открытия
-TECH_DENSITY_FACTOR = 0.05
+TECH_DENSITY_FACTOR = 10
 # Технологии, необходимые для морских путешествий
 SHIPBUILDING_TECH_FOR_COASTAL = 0.1 # Побережье
 SHIPBUILDING_TECH_FOR_OCEAN = 0.4 # Открытый океан

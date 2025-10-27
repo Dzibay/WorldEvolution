@@ -66,7 +66,8 @@ for i in range(nx - 1):
 faces = np.array(faces, dtype=np.uint32)
 
 verts = points.reshape(-1, 3)
-cols = colors.reshape(-1, 4)
+base_colors_3d = colors # (nx, ny, 4)
+base_cols_flat = colors.reshape(-1, 4) # (n*m, 4)
 
 # === 4. Создание сцены ===
 canvas = scene.SceneCanvas(keys="interactive", bgcolor="black", show=True, size=(1600, 1000))
@@ -77,20 +78,34 @@ view.camera = scene.cameras.TurntableCamera(fov=45, azimuth=0, elevation=30, dis
 earth_mesh = scene.visuals.Mesh(
     vertices=verts,
     faces=faces,
-    vertex_colors=cols,
+    vertex_colors=base_cols_flat, # <--- ИСПОЛЬЗУЕМ БАЗОВЫЕ
     shading='smooth',
     parent=view.scene
 )
+# Создаем один "рабочий" массив для цветов, чтобы не копировать его в цикле
+current_mesh_colors = base_cols_flat.copy()
 
 # === 5. Группы (красные точки) ===
-from simulation import HumanGroup, load_world
-from config import STARTING_CELL_COORDS, STARTING_POPULATION, SIMULATION_STEP_YEARS
 
-world_data = load_world()
-active_groups = [HumanGroup(0, *STARTING_CELL_COORDS, STARTING_POPULATION)]
+# Палитра для 10 государств (Цвета Империй)
+STATE_COLORS = [
+    (220, 20, 60),  # Crimson
+    (0, 0, 205),    # MediumBlue
+    (218, 165, 32), # Goldenrod
+    (0, 128, 0),    # Green
+    (128, 0, 128),  # Purple
+    (255, 140, 0),  # DarkOrange
+    (70, 130, 180), # SteelBlue
+    (210, 105, 30), # Chocolate
+    (100, 149, 237),# CornflowerBlue
+    (128, 128, 0),  # Olive
+]
+
+from simulation import Simulation, State
+sim = Simulation(nx=nx, ny=ny)
+sim.initialize()
 
 group_markers = scene.visuals.Markers(parent=view.scene)
-group_markers.set_data(np.array([[0, 0, 1]]), face_color='red', size=10)
 
 def grid_to_xyz(i, j, lift=0.002):
     base = points[i % nx, j % ny]
@@ -221,6 +236,7 @@ def get_group_info(entity):
         f"Позиция: ({entity.i},{entity.j})\n"
         f"Население: {int(entity.population)}\n"
         f"Еда: {getattr(entity, 'food', 0):.1f}\n"
+        f"Вода: {getattr(entity, 'water', 0):.1f}\n"
         f"Технологии: {getattr(entity, 'tech', 0):.3f}\n"
         f"Возраст: {getattr(entity, 'age', 0)}"
     )
@@ -280,7 +296,7 @@ def on_mouse_click(event):
 
     # Проверяем наличие группы поблизости
     min_dist = 0.01
-    for g in active_groups:
+    for g in sim.entities:
         pos_g = grid_to_xyz(g.i, g.j)
         if np.linalg.norm(pos_g - points[i, j]) < min_dist:
             text = get_group_info(g)
@@ -291,52 +307,80 @@ def on_mouse_click(event):
 
 # === 8. Симуляция ===
 current_year = -100000
-simulation_running = True
 update_interval_s = 0.5
 
 def update_simulation(event):
-    global current_year
-    if not simulation_running:
-        return
+    entities, year = sim.step()
+    hud.text = f"Год: {year}, Обьектов: {len(entities)}, Государств: {len([i for i in entities if isinstance(i, State)])}"
 
-    current_year += SIMULATION_STEP_YEARS
-    hud.text = f"Год: {current_year}"
+    # --- 1. Обновление маркеров (точки) ---
+    positions, marker_colors, sizes = [], [], []
+    
+    # --- 2. Обновление территорий (перекраска меша) ---
+    
+    # ОПТИМИЗАЦИЯ: Быстро "сбрасываем" карту к базовым цветам (in-place)
+    # Это во много раз быстрее, чем np.copy()
+    current_mesh_colors[:] = base_cols_flat
+    
+    state_idx = 0 # Для выбора цвета из палитры
+    
+    for e in entities:
+        # --- ЛОГИКА ТЕРРИТОРИЙ (для State) ---
+        if isinstance(e, State):
+            # Выбираем цвет для этой империи
+            color_rgb = STATE_COLORS[state_idx % len(STATE_COLORS)]
+            color_rgba = (color_rgb[0]/255, color_rgb[1]/255, color_rgb[2]/255, 1.0)
+            state_idx += 1
+            
+            # "Красим" все клетки, принадлежащие государству
+            print(f"Красим гос-во #{e.id}: {len(e.territory)} клеток, первый = {list(e.territory)[:3]}")
+            for (i, j) in e.territory:
+                # Находим 1D-индекс вершины
+                vertex_idx = i * ny + j 
+                # (Проверка на всякий случай, если индекс выйдет за пределы)
+                if 0 <= vertex_idx < len(current_mesh_colors):
+                    current_mesh_colors[vertex_idx] = color_rgba
+            
+            continue # Переходим к следующему агенту
 
-    new_entities = []
-    positions = []
-    colors = []
-
-    for g in list(active_groups):
-        if not g.alive:
-            active_groups.remove(g)
-            continue
-
-        result = g.step(world_data, debug=True)
-
-        # Создание племени
-        try:
-            from simulation import Tribe
-            if isinstance(result, Tribe):
-                print(f"➡ Группа #{g.id} создала племя #{result.id} ({result.i},{result.j})")
-                new_entities.append(result)
-                if g in active_groups:
-                    active_groups.remove(g)
-                continue
-        except Exception:
-            pass
-
-        pos = grid_to_xyz(g.i, g.j)
+        # --- ЛОГИКА ТОЧЕК (для всех, кроме State) ---
+        pos = grid_to_xyz(e.i, e.j)
         positions.append(pos)
-        if getattr(g, "stage", "group") == "tribe":
-            colors.append((1.0, 1.0, 0.0, 1.0))
+        
+        # Новая логика цветов:
+        if e.stage == "group":
+            marker_colors.append((1.0, 0.0, 0.0, 1.0)) # Красный (Мигранты)
+            sizes.append(6)
+        elif e.stage == "seafaring":
+            marker_colors.append((1.0, 1.0, 1.0, 1.0)) # Белый (Моряки)
+            sizes.append(8)
+        elif e.stage == "tribe":
+            marker_colors.append((1.0, 1.0, 0.0, 1.0)) # Желтый (Племя)
+            sizes.append(8)
+        elif e.stage == "city":
+            marker_colors.append((0.0, 1.0, 0.0, 1.0)) # Зеленый (Город)
+            sizes.append(10)
         else:
-            colors.append((1.0, 0.0, 0.0, 1.0))
+            marker_colors.append((0.5, 0.5, 0.5, 1.0)) # Серый (Неизвестно)
+            sizes.append(5)
 
-    if new_entities:
-        active_groups.extend(new_entities)
+    # 3. Применяем изменения
+    
+    # ОПТИМИЗАЦИЯ: Обновляем *только* буфер цветов (VBO)
+    # а не всю геометрию (вершины и грани)
+    earth_mesh.mesh_data.set_vertex_colors(current_mesh_colors)
+    earth_mesh.mesh_data_changed()  # 🔹 сообщает VisPy, что буфер обновлён
+    earth_mesh.update()
 
+    # Обновляем маркеры (агенты)
     if positions:
-        group_markers.set_data(np.array(positions), face_color=np.array(colors), size=10)
+        group_markers.set_data(
+            np.array(positions), 
+            face_color=np.array(marker_colors), 
+            size=np.array(sizes)
+        )
+    else:
+        group_markers.set_data(np.array([])) # Очищаем, если нет агентов
 
 # === 9. Таймер ===
 timer = app.Timer(interval=update_interval_s, connect=update_simulation, start=True)
@@ -344,10 +388,10 @@ timer = app.Timer(interval=update_interval_s, connect=update_simulation, start=T
 # === 10. Управление ===
 @canvas.events.key_press.connect
 def on_key(event):
-    global simulation_running, update_interval_s
+    global update_interval_s
     if event.key == 'P':
-        simulation_running = not simulation_running
-        print("⏸ Пауза" if not simulation_running else "▶ Продолжение")
+        sim.running = not sim.running
+        print("⏸ Пауза" if not sim.running else "▶ Продолжение")
     elif event.key in ['+', '=']:
         update_interval_s = max(0.05, update_interval_s / 1.5)
         timer.interval = update_interval_s
