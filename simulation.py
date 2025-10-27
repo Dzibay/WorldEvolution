@@ -95,14 +95,35 @@ class WorldCell:
             self.current_water_base = min(base_water, self.current_water_base * (1 + RESOURCE_REGENERATION_RATE))
 
 
-def load_world(filename="world_cells.json"):
+def load_world(filename="world_cells.json", nx=None, ny=None):
     with open(filename) as f:
         raw = json.load(f)
     world = {}
+    
+    # --- 1. Первый проход: Создаем все ячейки ---
     for c in raw:
         props = BIOME_DATA.get(c["biome"], BIOME_DATA["Plains"]).copy()
-        # WorldCell теперь сам инициализирует current_... через __post_init__
         world[(c["i"], c["j"])] = WorldCell(c["i"], c["j"], c["biome"], c["elevation_m"], props)
+
+    # --- 2. Второй проход: Динамически вычисляем 'is_coastal' ---
+    if nx is None or ny is None:
+        print("ПРЕДУПРЕЖДЕНИЕ: Размеры карты (nx, ny) не переданы, 'is_coastal' не будет вычислен.")
+        return world # Возвращаем как есть
+
+    print("Вычисление прибрежных зон...")
+    for (i, j), cell in world.items():
+        # Нас интересует только 'суша'
+        if cell.is_land:
+            # Проверяем 4 соседей
+            for di, dj in [(0,1), (0,-1), (1,0), (-1,0)]:
+                check_pos = ((i + di) % nx, (j + dj) % ny)
+                neighbor = world.get(check_pos)
+                
+                # Если сосед - океан, эта клетка - прибрежная
+                if neighbor and not neighbor.is_land:
+                    cell.properties["is_coastal"] = True
+                    break # Достаточно одного соседа-океана
+    
     return world
 
 
@@ -615,10 +636,40 @@ class City(BaseEntity):
 class SeafaringGroup(BaseEntity):
     def __init__(self, entity_id, i, j, population, start_tech=0.01):
         super().__init__(entity_id, i, j, population, start_tech)
+        print('Морская экспансия')
         self.stage = "seafaring"
         self.food = SEAFARING_FOOD_START * (population / 50) # Еды тем больше, чем больше группа
         self.water = 0.9 # Запасы воды на корабле
         self.need_food_per_capita = 0.003 # В "спячке" на корабле едят меньше
+
+    def update_population_seafaring(self):
+        """
+        Упрощенная демография для моряков. 
+        НЕТ "overpopulation_death". Смерть только от голода и тягот пути.
+        (Скопировано из HumanGroup)
+        """
+        if not self.alive:
+            return
+
+        # В пути нет чистого прироста, только базовая смертность и стресс
+        yearly_birth = DEATH_RATE_BASE 
+        yearly_death = DEATH_RATE_BASE
+        
+        # Стресс от голода и жажды
+        starvation_term = self.hunger_level * DEATH_RATE_STARVATION
+        dehydration_term = self.thirst_level * (DEATH_RATE_STARVATION * 0.5)
+
+        years = max(1, SIMULATION_STEP_YEARS)
+        
+        # Расчет базы БЕЗ 'overpop_death' и БЕЗ 'age_penalty'
+        base_rate = 1.0 + yearly_birth - (yearly_death + starvation_term + dehydration_term)
+        clamped_base_rate = max(0.0, base_rate) 
+        growth_factor = clamped_base_rate ** years
+
+        self.population = int(max(0, math.floor(self.population * growth_factor)))
+
+        if self.population <= 0:
+            self.alive = False
 
     def gather_resources(self, cell):
         """Рыбалка в океане"""
@@ -676,7 +727,7 @@ class SeafaringGroup(BaseEntity):
         self.age += SIMULATION_STEP_YEARS
         self.gather_resources(cell)
         self.consume_resources(cell) # Тратим еду/воду
-        self.update_population(cell) # Люди могут умирать в пути
+        self.update_population_seafaring() # Люди могут умирать в пути
 
         if not self.alive: # Погибли в море
             if debug: print(f"  [Потеря] Группа #{self.id} погибла в океане.")
@@ -709,6 +760,7 @@ class State:
         self.cities_coords = [] # Координаты (i, j)
         self.is_coastal = False # Есть ли выход к морю
         self.need_food_per_capita = 0.004
+        self.expansion_budget = 0.0 # <--- ДОБАВИТЬ "ОЧКИ ВЛИЯНИЯ"
 
     def absorb_entity(self, entity, world):
         """Поглощает сущность при формировании ИЛИ мигрантов"""
@@ -730,53 +782,57 @@ class State:
 
         entity.alive = False
 
-    def expand_territory(self, world, all_claimed_cells, nx, ny): # <--- ПРИНИМАЕМ nx, ny
+    def get_expansion_candidates(self, world, all_claimed_cells, nx, ny):
         """
-        Логика "культурного" расширения. 
-        Пытается присоединить 1-2 новые клетки на границе.
+        Новая "умная" логика: находит и ОЦЕНИВАЕТ все
+        пограничные клетки по их "желанности".
         """
-        # (Простая экспансия, можно усложнить)
-        expansion_attempts = 2 
+        candidates = {} # dict[coord, score]
         
-        # 1. Найти "границу" (клетки на краю территории)
-        #    (Это дорогая операция, но для макро-агента - нормально)
-        border_cells = set()
-        for (i, j) in self.territory:
-            for di, dj in [(0,1), (0,-1), (1,0), (-1,0)]: # 4 соседа
-                
-                # VVV --- ИЗМЕНЕНИЕ ЗДЕСЬ --- VVV
-                if nx is None or ny is None: # Проверка на случай, если nx/ny не переданы
-                    continue 
-                # Используем nx и ny, а не MAP_WIDTH/MAP_HEIGHT
-                check_pos = ((i + di) % nx, (j + dj) % ny) 
-                # ^^^ --------------------- ^^^
-                
-                # Если клетка *не* в нашей территории, она - кандидат
-                if check_pos not in self.territory:
-                    border_cells.add(check_pos)
-        
-        if not border_cells:
-            return # Некуда расширяться
+        if nx is None or ny is None:
+            return [] # Не можем работать без размеров карты
 
-        # 2. Пытаемся захватить несколько случайных
-        candidates = list(border_cells)
-        random.shuffle(candidates)
-        
-        added_count = 0
-        for (i, j) in candidates:
-            if added_count >= expansion_attempts:
-                break
-                
-            cell = world.get((i, j))
-            
-            # 3. Проверка:
-            # - Клетка существует
-            # - Это суша (не океан)
-            # - Она *еще никем* не занята (не принадлежит другому гос-ву)
-            if cell and cell.is_land and (i, j) not in all_claimed_cells:
-                self.territory.add((i, j))
-                all_claimed_cells.add((i, j)) # "Заявляем" права на нее
-                added_count += 1
+        for (i, j) in self.territory:
+            # Проверяем 8 соседей (для "заполнения" дыр)
+            for di in range(-1, 2):
+                for dj in range(-1, 2):
+                    if di == 0 and dj == 0: continue
+                    
+                    check_pos = ((i + di) % nx, (j + dj) % ny)
+                    
+                    # 1. Кандидат?
+                    # - Не наша территория И не чужая
+                    if check_pos not in self.territory and check_pos not in all_claimed_cells:
+                        cell = world.get(check_pos)
+                        
+                        # 2. Это суша?
+                        if cell and cell.is_land:
+                            
+                            # 3. Оценка "желанности"
+                            score = candidates.get(check_pos, 0.0)
+                            
+                            # +1.0 за пригодность (базовая ценность)
+                            score += cell.habitability
+                            
+                            # +2.0 за плодородность (сельское хозяйство)
+                            score += cell.arable * 2.0 
+                            
+                            # +1.5 за побережье (торговля/флот)
+                            if cell.is_coastal:
+                                score += 1.5
+                                
+                            # +0.5 за *каждого* соседа, который УЖЕ наш
+                            # (!!!) ЭТО РЕАЛИЗУЕТ ТВОЙ ЗАПРОС "СОЕДИНИТЬ ТЕРРИТОРИИ"
+                            # Клетка- "дырка", окруженная 8-ю нашими,
+                            # получит +4.0 и будет захвачена в первую очередь.
+                            if (i, j) in self.territory:
+                                score += 0.5
+                                
+                            candidates[check_pos] = score
+
+        # Возвращаем отсортированный список: (оценка, (i, j))
+        sorted_candidates = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+        return [(score, pos) for pos, score in sorted_candidates]
 
     def step(self, world, debug=False):
         """Шаг макро-агента (упрощенная экономика и рост)"""
@@ -851,13 +907,13 @@ def distance(i1, j1, i2, j2):
 
 class Simulation:
     def __init__(self, world_file="world_cells.json", nx=None, ny=None):
-        self.world = load_world(world_file)
+        self.world = load_world(world_file, nx, ny) # <--- ИЗМЕНЕНО
         self.entities = []
         self.year = START_YEAR
         self.running = True
         self.occupied_cells = set() # Для оптимизации регенерации
-        self.nx = nx # <--- СОХРАНЯЕМ
-        self.ny = ny # <--- СОХРАНЯЕМ
+        self.nx = nx 
+        self.ny = ny
 
     def initialize(self):
         start = HumanGroup(0, *STARTING_CELL_COORDS, STARTING_POPULATION)
@@ -996,7 +1052,6 @@ class Simulation:
         if entities_to_remove:
             self.entities = [e for e in self.entities if e not in entities_to_remove]
 
-
     def step(self, debug=False):
         if not self.running or not self.entities:
             self.running = False
@@ -1080,19 +1135,43 @@ class Simulation:
         # 4. Фаза Агрегации (Города -> Гос-ва)
         self.step_aggregation(debug=debug)
         
-        # === НОВАЯ ФАЗА 4.5: РАСШИРЕНИЕ ГОСУДАРСТВ ===
+        # === НОВАЯ ФАЗА 4.5: РЕАЛИСТИЧНОЕ РАСШИРЕНИЕ ===
         
-        # 1. Собираем ВСЕ занятые гос-вами клетки, чтобы они не воевали
+        # 1. Собираем ВСЕ занятые гос-вами клетки
         all_claimed_cells = set()
         states = [e for e in self.entities if isinstance(e, State)]
         for s in states:
             all_claimed_cells.update(s.territory)
             
-        # 2. Каждый штат пытается расшириться
+        # 2. Каждый штат накапливает "бюджет" и тратит его
         for s in states:
-            s.expand_territory(self.world, all_claimed_cells, self.nx, self.ny) # <--- ПЕРЕДАЕМ nx, ny
+            # Накапливаем "очки влияния" (бюджет)
+            # (Зависит от населения и технологий)
+            s.expansion_budget += (s.population / 150000.0) + (s.tech * 1.0)
             
-        # === КОНЕЦ НОВОЙ ФАЗЫ ===
+            # Получаем список лучших клеток для захвата
+            candidates = s.get_expansion_candidates(self.world, all_claimed_cells, self.nx, self.ny)
+            
+            # Тратим бюджет, пока он не кончится
+            # (Стоимость захвата = 1.0 очка)
+            while s.expansion_budget >= 1.0 and candidates:
+                # Берем лучшего кандидата
+                best_cell = candidates.pop(0)
+                best_pos = best_cell[1]
+                
+                # Захватываем
+                s.territory.add(best_pos)
+                all_claimed_cells.add(best_pos) # "Резервируем" клетку
+                s.expansion_budget -= 1.0
+
+                # Проверяем, стала ли страна прибрежной
+                if not s.is_coastal:
+                    cell = self.world.get(best_pos)
+                    if cell and cell.is_coastal:
+                        s.is_coastal = True
+                
+                # (Нужно также обновить список кандидатов, 
+                # т.к. мы изменили границу, но для простоты пропустим)
              
         # 5. Очистка мертвых
         self.entities = [e for e in self.entities if e.alive]

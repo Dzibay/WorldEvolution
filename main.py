@@ -241,6 +241,19 @@ def get_group_info(entity):
         f"Возраст: {getattr(entity, 'age', 0)}"
     )
 
+def get_state_info(state):
+    """Возвращает информацию о Государстве."""
+    return (
+        f"--- {state.stage.capitalize()} #{state.id} ---\n"
+        f"Столица: ({state.i},{state.j})\n"
+        f"Империя - {state.is_coastal}\n"
+        f"Население: {int(state.population)}\n"
+        f"Технологии: {state.tech:.3f}\n"
+        f"Возраст: {state.age} лет\n"
+        f"Размер: {len(state.territory)} клеток\n"
+        f"Города: {len(state.cities_coords)}"
+    )
+
 # === Добавим глобальный маркер для визуализации точки клика ===
 click_marker = scene.visuals.Markers(parent=view.scene)
 click_marker.set_data(np.array([[0, 0, 0]]), face_color='yellow', size=10)
@@ -256,20 +269,21 @@ def on_mouse_click(event):
 
     # === 1. Пересечение луча со сферой ===
     R = float(np.linalg.norm(points[0, 0]))  # радиус сферы из меша
-    # R — радиус сферы (у тебя уже есть)
-    a = np.dot(ray_dir, ray_dir)               # =1, но пусть будет общее
+    a = np.dot(ray_dir, ray_dir)
     b = 2.0 * np.dot(ray_origin, ray_dir)
     c = np.dot(ray_origin, ray_origin) - R*R
     delta = b*b - 4*a*c
     if delta < 0:
-        print("❌ Промах"); return
+        info_box.text = "Промах (дельта < 0)"
+        return
 
     sqrt_delta = np.sqrt(delta)
     t_candidates = [t for t in ((-b - sqrt_delta)/(2*a), (-b + sqrt_delta)/(2*a)) if t > 0]
     if not t_candidates:
-        print("❌ Пересечения позади камеры"); return
+        info_box.text = "Промах (позади камеры)"
+        return
 
-    t = min(t_candidates)  # ближайшая точка ВПЕРЕДИ камеры
+    t = min(t_candidates)
     hit_point = ray_origin + t * ray_dir
     x, y, z = hit_point
 
@@ -284,24 +298,47 @@ def on_mouse_click(event):
     j = int(np.clip(j, 0, ny - 1))
 
     # === 5. Обновляем маркер точки клика ===
-    # Поднимаем точку на 0.5% радиуса над поверхностью
-    lift = 0.005 * R  # 0.5% радиуса (можно изменить)
-    n = hit_point / np.linalg.norm(hit_point)  # нормаль наружу
+    lift = 0.005 * R 
+    n = hit_point / np.linalg.norm(hit_point)
     hit_lifted = hit_point + n * lift
 
     click_marker.set_data(np.array([hit_lifted]), face_color='yellow', size=12)
 
-    # === 6. Информация о клетке ===
+    # === 6. Информация о клетке (НОВАЯ ЛОГИКА) ===
+    
+    # Сначала всегда получаем инфо о клетке
     text = get_cell_info(i, j)
+    found_entity = False
 
-    # Проверяем наличие группы поблизости
-    min_dist = 0.01
-    for g in sim.entities:
-        pos_g = grid_to_xyz(g.i, g.j)
-        if np.linalg.norm(pos_g - points[i, j]) < min_dist:
-            text = get_group_info(g)
-            break
+    # 1. ПРОВЕРКА ГОСУДАРСТВ (по территории)
+    # Сначала ищем, не кликнули ли мы по территории
+    states = [e for e in sim.entities if isinstance(e, State)]
+    for s in states:
+        if (i, j) in s.territory:
+            text = get_state_info(s) # Заменяем текст
+            found_entity = True
+            break # Нашли, выходим
 
+    # 2. ПРОВЕРКА АГЕНТОВ (по точке)
+    # Если не нашли гос-во, ищем точечных агентов
+    if not found_entity:
+        min_dist = 0.01 # Радиус "попадания"
+        
+        # Координаты центра кликнутой клетки
+        pos_cell = points[i % nx, j % ny] 
+        
+        # Ищем только "точки" (не Государства)
+        point_entities = [e for e in sim.entities if not isinstance(e, State)]
+        
+        for g in point_entities:
+            pos_g = grid_to_xyz(g.i, g.j, lift=0.0) # Получаем XYZ агента (без "лифта")
+            
+            # Сравниваем XYZ агента с XYZ центра клетки
+            if np.linalg.norm(pos_g - pos_cell) < min_dist:
+                text = get_group_info(g) # Заменяем текст
+                break
+
+    # Обновляем инфо-бокс
     info_box.text = text
 
 
@@ -333,7 +370,6 @@ def update_simulation(event):
             state_idx += 1
             
             # "Красим" все клетки, принадлежащие государству
-            print(f"Красим гос-во #{e.id}: {len(e.territory)} клеток, первый = {list(e.territory)[:3]}")
             for (i, j) in e.territory:
                 # Находим 1D-индекс вершины
                 vertex_idx = i * ny + j 
@@ -380,7 +416,8 @@ def update_simulation(event):
             size=np.array(sizes)
         )
     else:
-        group_markers.set_data(np.array([])) # Очищаем, если нет агентов
+        # Очищаем, передавая пустой массив *правильной* формы (0, 3)
+        group_markers.set_data(np.empty((0, 3)))
 
 # === 9. Таймер ===
 timer = app.Timer(interval=update_interval_s, connect=update_simulation, start=True)
