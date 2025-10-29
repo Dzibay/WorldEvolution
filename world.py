@@ -13,7 +13,7 @@ from biomes_data import RAW_BIOME_HEX_MAP, hex_to_rgb
 try:
     # Карта 1: Карта БИОМОВ (ЦВЕТ)
     # Используем твой .jpg файл, новый алгоритм с ним справится
-    img_path_color = "data/biomes.jpg" 
+    img_path_color = "data/biomes.png" 
     img_color = Image.open(img_path_color).convert("RGB")
     
     # Карта 2: Карта ВЫСОТ (ДАННЫЕ)

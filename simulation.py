@@ -3,42 +3,6 @@ from dataclasses import dataclass
 from biomes_properties import BIOME_DATA
 from config import *
 
-# =======================================
-# === 0. НОВЫЕ КОНСТАНТЫ (для config.py) ==
-# =======================================
-# (В идеале - перенести в config.py)
-
-# Истощение и регенерация
-RESOURCE_REGENERATION_RATE = 0.005  # 0.5% в шаг
-RESOURCE_DEPLETION_RATE = 0.00001 # коэфф. истощения от населения
-CELL_REGEN_TICK_RATE = 0.1 # 10% клеток регенерируют каждый шаг (для FPS)
-
-# Логика сна
-AGENT_SLEEP_THRESHOLD_STEPS = 5 # "Уснуть" на 5 шагов (50 лет)
-AGENT_STABLE_GROWTH_RATE = 0.01 # Стабильный, если рост < 1%
-
-# Логика миграции
-MIGRATION_IMMUNITY_STEPS = 5     # 150 лет "иммунитета" у новых групп
-MIGRATION_STRESS_THRESHOLD = 0.6  # Порог для миграции племен/городов (голод/перенаселение)
-
-# Логика мореплавания
-SEAFARING_TECH_THRESHOLD = 0.3    # Технология для постройки лодок
-SEAFARING_FOOD_START = 100.0      # Запас еды на старте
-SEAFARING_LAND_SENSE_RADIUS = 5   # "Видимость" земли из океана (в клетках)
-SEAFARING_SPAWN_CHANCE = 0.05     # Шанс для Гос-ва отправить колонистов
-
-# Логика агрегации
-CITY_INFLUENCE_RADIUS = 6        # "Зона влияния" города (поглощает племена)
-STATE_FOUNDING_POP = 7000        # Порог населения для "Государства"
-STATE_FOUNDING_TECH = 0.25        # Порог технологий для "Государства"
-STATE_INFLUENCE_RADIUS = 15       # "Зона влияния" при формировании Гос-ва
-
-# Логика макро-агента "Государство"
-MACRO_FOOD_PRODUCTION_FACTOR = 0.05 # Базовый коэфф. еды
-MACRO_TECH_FACTOR = 0.0001        # Скорость роста технологий
-MACRO_BIRTH_RATE = 0.02           # Базовая годовая рождаемость
-MACRO_DEATH_RATE = 0.015          # Базовая годовая смертность
-
 
 # =======================================
 # === 1. КЛАСС КЛЕТКИ (Изменен) ========
@@ -95,7 +59,7 @@ class WorldCell:
             self.current_water_base = min(base_water, self.current_water_base * (1 + RESOURCE_REGENERATION_RATE))
 
 
-def load_world(filename="world_cells.json", nx=None, ny=None):
+def load_world(filename, nx=None, ny=None):
     with open(filename) as f:
         raw = json.load(f)
     world = {}
@@ -319,44 +283,50 @@ class HumanGroup(BaseEntity):
     
     def choose_next_direction(self, world):
         """
-        Логика полностью изменена:
-        1. Агенты "слепы" (не знают habitability/food).
-        2. Они пытаются уйти как можно дальше от "дома" (home_coord).
+        Более реалистичная логика миграции:
+        - стремимся уйти от дома;
+        - предпочитаем более пригодные для жизни клетки;
+        - сохраняем общее направление (инерция);
+        - избегаем топтания на месте.
         """
-        dirs = [(1,0),(-1,0),(0,1),(-1,0),(1,1),(-1,-1),(1,1),(-1,1)]
-        random.shuffle(dirs)
-        
+        if not hasattr(self, "direction"):
+            self.direction = (random.choice([-1, 0, 1]), random.choice([-1, 0, 1]))
+
+        dirs = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if not (dx == 0 and dy == 0)]
         best_pos, best_score = None, -999
-        
-        # Текущая дистанция от дома
         current_dist = self._distance_from_home(self.i, self.j)
 
         for dx, dy in dirs:
             nx, ny = self.i + dx, self.j + dy
-            
-            # 1. Проверка валидности (не ходить назад, не в воду)
-            if (nx, ny) in self.path[-5:]: # Не топчемся на месте
+            if (nx, ny) in self.path[-5:]:
                 continue
             cell = world.get((nx, ny))
             if not cell or not cell.is_land:
                 continue
-            
-            # 2. Оценка: "Слепой" выбор, основанный *только* на удалении от дома
-            # МЫ НЕ СМОТРИМ cell.habitability
-            new_dist = self._distance_from_home(nx, ny)
-            
-            # Оценка = насколько мы *увеличили* дистанцию
-            score = new_dist - current_dist 
-            
-            # (Небольшая случайность, чтобы не всегда идти по прямой)
-            score += random.uniform(-0.1, 0.1) 
-            
+
+            # 1. Увеличение расстояния от дома
+            dist_score = (self._distance_from_home(nx, ny) - current_dist) * 0.6
+
+            # 2. Пригодность местности
+            terrain_score = (cell.habitability * 0.7 + cell.arable * 0.5 + cell.food_availability * 0.3)
+
+            # 3. Инерция — предпочтение прежнего направления
+            dir_alignment = 1.0 if (dx, dy) == self.direction else 0.5 if (dx*dy == 0) else 0.3
+
+            # 4. Небольшая случайность
+            random_bonus = random.uniform(-0.2, 0.2)
+
+            score = dist_score + terrain_score + dir_alignment + random_bonus
+
             if score > best_score:
                 best_score, best_pos = score, (nx, ny)
 
-        # best_pos будет содержать "наименее плохой" вариант,
-        # даже если все ходы ведут "к дому" (best_score < 0)
+        # обновляем направление
+        if best_pos:
+            self.direction = (best_pos[0] - self.i, best_pos[1] - self.j)
+
         return best_pos
+
     
     def gather_resources_migrant(self, cell):
         """Упрощенный сбор (собирательство/охота на ходу)"""
@@ -371,32 +341,44 @@ class HumanGroup(BaseEntity):
     
     def update_population_migrant(self):
         """
-        Упрощенная демография для мигрантов. 
-        НЕТ "overpopulation_death". Смерть только от голода и тягот пути.
+        Демография кочевой группы:
+        - может немного расти, если обеспечена едой и водой;
+        - голод/жажда дают высокую смертность;
+        - возраст не учитывается, так как это "молодые" мигранты.
         """
         if not self.alive:
             return
 
-        # В пути нет чистого прироста, только базовая смертность и стресс
-        # Мы приравниваем рождаемость к смертности, чтобы "идеальная" база = 1.0
-        yearly_birth = DEATH_RATE_BASE 
-        yearly_death = DEATH_RATE_BASE
+        # --- Базовые коэффициенты ---
+        base_birth = BIRTH_RATE_BASE * 0.5  # кочевники размножаются медленнее
+        base_death = DEATH_RATE_BASE * 0.8  # немного ниже (молодые, мобильные)
         
-        # Стресс от голода и жажды
+        # --- Влияние состояния ---
+        # Если еды и воды хватает — повышаем рождаемость
+        resource_factor = (self.food / (self.population * self.need_food_per_capita * 100 + 1e-9))
+        if resource_factor > 1.0:
+            base_birth *= min(2.0, resource_factor)  # максимум ×2
+        elif resource_factor < 0.5:
+            base_birth *= resource_factor            # меньше еды — меньше рождаемость
+
+        # --- Стресс от голода и жажды ---
         starvation_term = self.hunger_level * DEATH_RATE_STARVATION
         dehydration_term = self.thirst_level * (DEATH_RATE_STARVATION * 0.5)
 
+        # --- Итоговые ставки ---
+        yearly_birth = base_birth
+        yearly_death = base_death + starvation_term + dehydration_term
+
         years = max(1, SIMULATION_STEP_YEARS)
-        
-        # Расчет базы БЕЗ 'overpop_death' и БЕЗ 'age_penalty'
-        base_rate = 1.0 + yearly_birth - (yearly_death + starvation_term + dehydration_term)
-        clamped_base_rate = max(0.0, base_rate) 
+        base_rate = 1.0 + yearly_birth - yearly_death
+        clamped_base_rate = max(0.0, base_rate)
         growth_factor = clamped_base_rate ** years
 
         self.population = int(max(0, math.floor(self.population * growth_factor)))
 
         if self.population <= 0:
             self.alive = False
+
 
     def step(self, cell, world, debug=False):
         """
@@ -456,7 +438,14 @@ class HumanGroup(BaseEntity):
             self.next_pos = new_pos 
         else:
             # Некуда идти, вынужденно оседаем
-            self.is_migrating = False 
+            self.is_migrating = False
+        
+        # 5. Превращение в мореплавателей, если достигли побережья и технологий
+        if cell.is_coastal and self.tech >= SEAFARING_TECH_THRESHOLD and random.random() < 0.5:
+            if debug:
+                print(f"  [Эволюция] Группа #{self.id} ({self.i},{self.j}) стала мореплавателями (tech={self.tech:.3f})")
+            self.alive = False
+            return SeafaringGroup(self.id, self.i, self.j, self.population, start_tech=self.tech)
             
         return None
 
@@ -636,11 +625,13 @@ class City(BaseEntity):
 class SeafaringGroup(BaseEntity):
     def __init__(self, entity_id, i, j, population, start_tech=0.01):
         super().__init__(entity_id, i, j, population, start_tech)
-        print('Морская экспансия')
         self.stage = "seafaring"
-        self.food = SEAFARING_FOOD_START * (population / 50) # Еды тем больше, чем больше группа
-        self.water = 0.9 # Запасы воды на корабле
-        self.need_food_per_capita = 0.003 # В "спячке" на корабле едят меньше
+        self.food = SEAFARING_FOOD_START * (population / 50)
+        self.water = 0.9
+        self.need_food_per_capita = 0.003
+        self.steps_at_sea = 0
+        self.ignore_land_steps = 8  # 🔹 первые 8 шагов не возвращаемся к берегу
+        self.direction = random.choice([(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,-1),(1,-1),(-1,1)])
 
     def update_population_seafaring(self):
         """
@@ -678,38 +669,50 @@ class SeafaringGroup(BaseEntity):
         self.water = max(0.0, self.water - 0.05) 
 
     def choose_next_direction(self, world):
-        """Ищет землю, если не видит - плывет в случайном направлении"""
-        # 1. Поиск земли в "радиусе видимости"
+        """Плавание с инерцией и временным игнорированием суши"""
+        self.steps_at_sea += 1
+
+        # Пока не истёк "игнор суши" — плывём по инерции
+        if self.steps_at_sea < self.ignore_land_steps:
+            nx, ny = self.i + self.direction[0], self.j + self.direction[1]
+            cell = world.get((nx, ny))
+            if cell and not cell.is_land:
+                return (nx, ny)
+
+        # Ищем землю только после того, как уплыли достаточно далеко
         best_land_pos = None
         min_dist = SEAFARING_LAND_SENSE_RADIUS + 1
-        
-        # (Это дорогая операция, но она нужна)
         for r in range(1, SEAFARING_LAND_SENSE_RADIUS + 1):
             for dx in range(-r, r + 1):
                 for dy in range(-r, r + 1):
-                    if dx == 0 and dy == 0: continue
+                    if dx == 0 and dy == 0:
+                        continue
                     nx, ny = self.i + dx, self.j + dy
                     cell = world.get((nx, ny))
                     if cell and cell.is_land:
-                        dist = max(abs(dx), abs(dy)) # Чебышевское расстояние
+                        dist = max(abs(dx), abs(dy))
                         if dist < min_dist:
                             min_dist = dist
-                            # Двигаться в *направлении* земли, а не к ней
-                            best_land_pos = (self.i + (1 if dx > 0 else -1 if dx < 0 else 0), 
+                            best_land_pos = (self.i + (1 if dx > 0 else -1 if dx < 0 else 0),
                                              self.j + (1 if dy > 0 else -1 if dy < 0 else 0))
             if best_land_pos:
-                 return best_land_pos # Нашли ближайшее направление
+                # не сразу к суше — шанс 50% "игнорировать" её
+                if random.random() < 0.5:
+                    continue
+                self.direction = (best_land_pos[0] - self.i, best_land_pos[1] - self.j)
+                return best_land_pos
 
-        # 2. Если земля не найдена - плывем по воде
+        # иначе — случайное дрейфование с инерцией
         dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,-1),(1,-1),(-1,1)]
         random.shuffle(dirs)
         for dx, dy in dirs:
             nx, ny = self.i + dx, self.j + dy
             cell = world.get((nx, ny))
-            if cell and not cell.is_land: # Двигаться только по воде
+            if cell and not cell.is_land:
+                self.direction = (dx, dy)
                 return (nx, ny)
-        
-        return None # Застряли
+
+        return None
 
     def step(self, cell, world, debug=False):
         if not self.alive: return None
