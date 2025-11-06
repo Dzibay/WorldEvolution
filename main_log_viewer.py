@@ -2,6 +2,7 @@ import json, os, numpy as np
 from vispy import app, scene
 from vispy.scene.visuals import Text
 from PyQt6 import QtWidgets, QtCore
+import gzip
 
 app.use_app('pyqt6')  # важно
 
@@ -111,7 +112,10 @@ class LogViewer(QtWidgets.QMainWindow):
     # ------------------------------------------------------------
 
     def refresh_log_files(self):
-        files = [f for f in os.listdir("logs") if f.endswith(".json")]
+        files = [
+            f for f in os.listdir("logs")
+            if f.endswith(".json") or f.endswith(".json.gz")
+        ]
         self.combo_log.addItems(files)
 
     def load_world(self):
@@ -173,8 +177,14 @@ class LogViewer(QtWidgets.QMainWindow):
         print(f"📜 Загружаем лог: {full_path}")
 
         try:
-            with open(full_path, "r", encoding="utf-8") as f:
-                self.current_log = json.load(f)
+            if filename.endswith(".gz"):
+                with gzip.open(full_path, "rt", encoding="utf-8") as f:
+                    self.current_log = json.load(f)
+                    print('yee')
+            else:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    self.current_log = json.load(f)
+
         except Exception as e:
             print("Ошибка при чтении лога:", e)
             return

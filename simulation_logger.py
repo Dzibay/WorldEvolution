@@ -1,15 +1,16 @@
-import json
-import os
+import json, gzip, os, sys
 from statistics import mean
 from simulation import Simulation
 from config import CHECKPOINT_INTERVAL, END_YEAR
-import sys
 
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
+SEGMENT_YEARS = 10_000  # сколько лет в одном gzip-файле
+
+# === Вспомогательные функции ===
+
 def serialize_entity(e):
-    """Конвертирует объект сущности в компактный формат для JSON"""
     base = {
         "id": e.id,
         "stage": e.stage,
@@ -19,15 +20,12 @@ def serialize_entity(e):
         "tech": round(e.tech, 4),
         "alive": e.alive
     }
-
-    # 🔹 Если это Государство — добавляем территорию
     if hasattr(e, "territory"):
-        base["territory"] = list(map(list, e.territory))  # [[i,j], [i,j], ...]
-
+        base["territory"] = list(map(list, e.territory))
     return base
 
+
 def summarize_world(entities):
-    """Создаёт сводку по состоянию мира"""
     stages = {}
     pops = []
     techs = []
@@ -37,7 +35,7 @@ def summarize_world(entities):
         pops.append(e.population)
         techs.append(e.tech)
 
-    summary = {
+    return {
         "total_entities": len(entities),
         "total_population": int(sum(pops)),
         "avg_population": round(sum(pops) / len(pops), 2) if pops else 0,
@@ -45,11 +43,9 @@ def summarize_world(entities):
         "avg_tech": round(mean(techs), 4) if techs else 0.0,
         "stages": stages
     }
-    return summary
 
-def run_and_log_simulation(steps=5000, debug=False):
-    """Запускает симуляцию и сохраняет промежуточные состояния"""
-    # === 1. Загрузка карты ячеек ===
+
+def run_and_log_simulation(debug=False):
     JSON_FILE = "world_cells.json"
     try:
         with open(JSON_FILE, "r", encoding="utf-8") as f:
@@ -64,47 +60,47 @@ def run_and_log_simulation(steps=5000, debug=False):
     sim = Simulation(nx=nx, ny=ny)
     sim.initialize()
 
-    log = []  # Список состояний
+    segment_log = []
+    segment_start_year = sim.year
     last_logged_year = sim.year
+    total_snapshots = 0
 
-    for step in range(steps):
+    print(f"🌍 Старт симуляции: {segment_start_year} → {END_YEAR}")
+
+    while sim.year < END_YEAR:
         entities, year = sim.step(debug=debug)
-
         if not sim.running:
-            print("Симуляция завершена (все сущности вымерли).")
+            print("❌ Симуляция остановлена (все сущности вымерли).")
             break
 
-        # Каждые CHECKPOINT_INTERVAL лет сохраняем снимок
-        if (year - last_logged_year) >= CHECKPOINT_INTERVAL or year >= END_YEAR:
+        # Каждые CHECKPOINT_INTERVAL лет — лог
+        if (year - last_logged_year) >= CHECKPOINT_INTERVAL:
             summary = summarize_world(entities)
             snapshot = {
                 "year": year,
                 "summary": summary,
                 "entities": [serialize_entity(e) for e in entities if e.alive]
             }
-            log.append(snapshot)
+            segment_log.append(snapshot)
+            total_snapshots += 1
             print(f"🧭 {year}: {summary['total_entities']} объектов, "
                   f"население {summary['total_population']}, "
                   f"гос-в {summary['stages'].get('state', 0)}")
             last_logged_year = year
 
-        if year >= END_YEAR:
-            print("Достигнут конец симуляции.")
-            break
+        # --- сохраняем сегмент каждые SEGMENT_YEARS ---
+        if (year - segment_start_year) >= SEGMENT_YEARS or year >= END_YEAR:
+            seg_filename = os.path.join(LOG_DIR, f"simulation_{segment_start_year}_{year}.json.gz")
+            with gzip.open(seg_filename, "wt", encoding="utf-8") as f:
+                json.dump(segment_log, f, ensure_ascii=False, separators=(",", ":"))
+            print(f"💾 Сегмент {segment_start_year} → {year} сохранён "
+                  f"({len(segment_log)} кадров, gzip {round(os.path.getsize(seg_filename)/1024/1024,2)} MB)")
+            segment_log = []
+            segment_start_year = year
 
-    # --- Сохраняем результат ---
-    log_filename = os.path.join(LOG_DIR, f"simulation_log_{log[0]['year']}_{year}.json")
-    with open(log_filename, "w", encoding="utf-8") as f:
-        json.dump(log, f, indent=2, ensure_ascii=False)
-    print(f"✅ Лог сохранён: {log_filename} ({len(log)} записей)")
+    print(f"✅ Симуляция завершена ({total_snapshots} кадров)")
+    return True
 
-    last = log[-1]
-    states = [e for e in last["entities"] if e["stage"] == "state"]
-    print(f"Последний снимок: {len(states)} государств")
-    for s in states[:3]:
-        print("  ▶", s["id"], len(s.get("territory", [])), "клеток")
-
-    return log_filename
 
 if __name__ == "__main__":
-    run_and_log_simulation(steps=1500, debug=False)
+    run_and_log_simulation(debug=False)

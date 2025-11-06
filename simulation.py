@@ -838,66 +838,81 @@ class State:
         return [(score, pos) for pos, score in sorted_candidates]
 
     def step(self, world, debug=False):
-        """Шаг макро-агента (упрощенная экономика и рост)"""
-        if not self.alive: return []
+        if not self.alive:
+            return []
         self.age += SIMULATION_STEP_YEARS
-        
         new_entities = []
-        
-        # 1. Макро-Экономика (очень упрощенно)
+
+        # 1. Макроэкономические показатели
         total_habitability = 0.0
         total_food_prod = 0.0
+        total_arable = 0.0
         for (i, j) in self.territory:
             cell = world.get((i, j))
-            if cell:
-                total_habitability += cell.habitability
-                total_food_prod += (cell.arable + cell.food_availability)
-        
-        avg_habitability = total_habitability / (len(self.territory) + 1e-9)
-        food_production = total_food_prod * (1 + self.tech) * MACRO_FOOD_PRODUCTION_FACTOR * len(self.territory)
+            if not cell:
+                continue
+            total_habitability += cell.habitability
+            total_food_prod += (cell.arable + cell.food_availability)
+            total_arable += cell.arable
+
+        n_cells = max(1, len(self.territory))
+        avg_habitability = total_habitability / n_cells
+        avg_arable = total_arable / n_cells
+
+        # 2. Производство еды и вместимость (ограничение роста)
+        base_capacity = n_cells * avg_habitability * CARRYING_CAPACITY_FACTOR
+        tech_capacity_multiplier = 1.0 + (self.tech * 4.0)
+        effective_capacity = base_capacity * tech_capacity_multiplier
+
+        # Производство пищи — завиcит от ареала и технологий
+        # Учитываем богатство ресурсов: дерево, камень, руда
+        resource_bonus = 1.0 + (
+            (total_arable / n_cells) * 0.4 +
+            (sum(world[(i, j)].properties.get("wood_yield", 0) for (i, j) in self.territory) / n_cells) * 0.2 +
+            (sum(world[(i, j)].properties.get("stone_yield", 0) for (i, j) in self.territory) / n_cells) * 0.2 +
+            (sum(world[(i, j)].properties.get("ore_yield", 0) for (i, j) in self.territory) / n_cells) * 0.3
+        )
+        food_production = total_food_prod * (1 + self.tech) * MACRO_FOOD_PRODUCTION_FACTOR * n_cells * resource_bonus
         food_needed = self.population * self.need_food_per_capita
-        
         food_surplus_ratio = (food_production - food_needed) / (food_needed + 1e-9)
-        
-        # 2. Макро-Демография
-        # (Используем годовые ставки и возводим в степень)
+
+        # 3. Демография с насыщением (логистическая модель)
+        growth_base = MACRO_BIRTH_RATE * (1 + avg_habitability * 0.5) * (1 + min(0.5, food_surplus_ratio))
+        death_base = MACRO_DEATH_RATE * (1 - avg_habitability * 0.5)
+        overpop_penalty = max(0.0, (self.population / (effective_capacity + 1e-9)) - 1.0) * 0.05
+
+        yearly_growth = growth_base - death_base - overpop_penalty
         years = max(1, SIMULATION_STEP_YEARS)
-        yearly_birth = MACRO_BIRTH_RATE * (1 + avg_habitability * 0.5) * (1 + min(0.5, food_surplus_ratio))
-        yearly_death = MACRO_DEATH_RATE * (1 - avg_habitability * 0.5) * (1 - max(-0.5, food_surplus_ratio * 0.5))
-        
-        growth_factor = (1.0 + yearly_birth - yearly_death) ** years
+        growth_factor = (1.0 + yearly_growth) ** years
         self.population = int(max(1, self.population * growth_factor))
 
-        # 3. Макро-Технологии
-        tech_gain = (len(self.cities_coords) * 0.1) * (self.population / 100000.0) * MACRO_TECH_FACTOR
+        # 4. Рост технологий теперь тоже ограничен
+        tech_gain = (len(self.cities_coords) / 5) * (self.population / (effective_capacity + 1e-9)) * MACRO_TECH_FACTOR
         self.tech = min(1.0, self.tech + tech_gain)
-        
-        # 4. Колонизация (только морская, как по заданию)
+
+        # 5. Расширение и морские колонии (оставляем как есть)
         if self.is_coastal and self.tech > SEAFARING_TECH_THRESHOLD and random.random() < SEAFARING_SPAWN_CHANCE:
-            # Ищем случайный прибрежный город для старта
             start_coord = random.choice(self.cities_coords) if self.cities_coords else (self.i, self.j)
             new_pop = random.randint(100, 300)
-            
-            # Находим ближайшую к городу *водную* клетку
-            water_cell_pos = None
-            for di, dj in [(0,1), (0,-1), (1,0), (-1,0)]:
+            for di, dj in [(0,1),(0,-1),(1,0),(-1,0)]:
                 check_pos = (start_coord[0] + di, start_coord[1] + dj)
                 cell = world.get(check_pos)
                 if cell and not cell.is_land:
-                    water_cell_pos = check_pos
+                    self.population -= new_pop
+                    new_colonists = SeafaringGroup(
+                        random.randint(10000, 99999), *check_pos, new_pop, start_tech=self.tech * 0.7
+                    )
+                    new_entities.append(new_colonists)
+                    if debug:
+                        print(f"  [Колонизация] Гос-во #{self.id} отправило флот из {start_coord}")
                     break
-            
-            if water_cell_pos:
-                self.population -= new_pop
-                new_colonists = SeafaringGroup(random.randint(10000, 99999), *water_cell_pos, new_pop, start_tech=self.tech * 0.7)
-                new_entities.append(new_colonists)
-                if debug:
-                    print(f"  [Колонизация] Гос-во #{self.id} отправило группу #{new_colonists.id} в море!")
 
         if debug:
-            print(f"[STATE #{self.id}] Pop={self.population}, Tech={self.tech:.4f}, Territory={len(self.territory)} cells, Cities={len(self.cities_coords)}")
+            print(f"[STATE #{self.id}] Pop={self.population}, Cap={int(effective_capacity)}, "
+                f"Tech={self.tech:.3f}, Terr={len(self.territory)}, FoodΔ={food_surplus_ratio:+.2f}")
 
         return new_entities
+
 
 
 # =======================================
@@ -1138,33 +1153,49 @@ class Simulation:
         # 4. Фаза Агрегации (Города -> Гос-ва)
         self.step_aggregation(debug=debug)
         
-        # === НОВАЯ ФАЗА 4.5: РЕАЛИСТИЧНОЕ РАСШИРЕНИЕ ===
-        
-        # 1. Собираем ВСЕ занятые гос-вами клетки
+        # === ФАЗА 4.5: Реалистичное расширение стран ===
+
+        # 1. Собираем все занятые гос-вами клетки
         all_claimed_cells = set()
         states = [e for e in self.entities if isinstance(e, State)]
         for s in states:
             all_claimed_cells.update(s.territory)
-            
+
         # 2. Каждый штат накапливает "бюджет" и тратит его
         for s in states:
-            # Накапливаем "очки влияния" (бюджет)
-            # (Зависит от населения и технологий)
-            s.expansion_budget += (s.population / 150000.0) + (s.tech * 1.0)
-            
-            # Получаем список лучших клеток для захвата
+            # --- Вычисляем средние характеристики территории ---
+            total_habitability = 0.0
+            total_food = 0.0
+            total_arable = 0.0
+            total_cells = max(1, len(s.territory))
+
+            for (i, j) in s.territory:
+                cell = self.world.get((i, j))
+                if not cell:
+                    continue
+                total_habitability += cell.habitability
+                total_food += (cell.food_availability + cell.arable)
+                total_arable += cell.arable
+
+            avg_habit = total_habitability / total_cells
+            avg_food = total_food / total_cells
+            avg_arable = total_arable / total_cells
+
+            # --- Определяем ресурсный коэффициент ---
+            avg_resource = (avg_food + avg_arable + avg_habit) / 3
+            resource_factor = max(0.1, avg_resource)  # чем беднее территория, тем меньше прирост влияния
+
+            # --- Начисляем очки расширения ---
+            s.expansion_budget += ((s.population / 300_000.0) + (s.tech * 0.8)) * resource_factor
+
+            # --- Получаем список лучших кандидатов ---
             candidates = s.get_expansion_candidates(self.world, all_claimed_cells, self.nx, self.ny)
-            
-            # Тратим бюджет, пока он не кончится
-            # (Стоимость захвата = 1.0 очка)
+
+            # --- Захватываем клетки, пока хватает бюджета ---
             while s.expansion_budget >= 1.0 and candidates:
-                # Берем лучшего кандидата
-                best_cell = candidates.pop(0)
-                best_pos = best_cell[1]
-                
-                # Захватываем
+                best_score, best_pos = candidates.pop(0)
                 s.territory.add(best_pos)
-                all_claimed_cells.add(best_pos) # "Резервируем" клетку
+                all_claimed_cells.add(best_pos)
                 s.expansion_budget -= 1.0
 
                 # Проверяем, стала ли страна прибрежной
@@ -1172,15 +1203,24 @@ class Simulation:
                     cell = self.world.get(best_pos)
                     if cell and cell.is_coastal:
                         s.is_coastal = True
-                
-                # (Нужно также обновить список кандидатов, 
-                # т.к. мы изменили границу, но для простоты пропустим)
              
         # 5. Очистка мертвых
         self.entities = [e for e in self.entities if e.alive]
         
         if not self.entities:
             self.running = False
+
+        # Ускорение прогресса
+        if self.year > -10000:
+            BIRTH_RATE_BASE = 0.0005
+            TECH_DISCOVERY_CHANCE_BASE = 0.00008
+            CARRYING_CAPACITY_FACTOR = 150
+            for e in self.entities:
+                if isinstance(e, BaseEntity):
+                    e.tech += 0.0005
+        if self.year > -5000:
+            STATE_FOUNDING_TECH = 0.4
+            STATE_FOUNDING_POP = 80000
 
         return self.entities, self.year
 
