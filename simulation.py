@@ -5,7 +5,55 @@ from config import *
 
 
 # =======================================
-# === 1. КЛАСС КЛЕТКИ (Изменен) ========
+# === ДОП. КОНСТАНТЫ ДЛЯ МАКРО-ДЕМО ====
+# =======================================
+
+# Базовые демографические параметры для государств (в год)
+STATE_BASE_FERTILITY = 0.035      # базовая рождаемость (детей на взрослого в год)
+STATE_CHILD_MORTALITY = 0.03      # смертность детей в год
+STATE_ADULT_MORTALITY = 0.015     # смертность взрослых в год
+STATE_ELDER_MORTALITY = 0.06      # смертность пожилых в год
+
+# Возрастные "ширины" (лет) для перехода между группами
+CHILD_YEARS = 15.0                # 0-14
+ADULT_YEARS = 45.0                # 15-59 (условно)
+ELDER_YEARS = 20.0                # 60-79+ (условно)
+
+# Порог для "крупного" государства, где могут начаться эпидемии
+EPIDEMIC_POP_THRESHOLD = 80_000
+EPIDEMIC_DENSITY_FACTOR = 0.002   # влияние плотности
+EPIDEMIC_BASE_CHANCE = 0.0008     # базовый шанс эпидемии на шаг
+EPIDEMIC_DECAY_PER_STEP = 0.05    # как быстро эпидемия сходит на нет (0..1)
+EPIDEMIC_MORTALITY_MULT = 0.03    # масштаб доп. смертности при эпидемии
+
+# Голод
+FAMINE_FOOD_DEFICIT_THRESHOLD = -0.1  # food_surplus_ratio ниже этого => голод
+FAMINE_YEARS_SCALE = 50.0             # через сколько лет голода достигается max-эффект
+FAMINE_EXTRA_MORTALITY = 0.01         # базовое добавление к смертности при сильном голоде
+FAMINE_BIRTH_REDUCTION = 0.3          # насколько падает рождаемость при сильном голоде
+
+# Война
+WAR_EXTRA_MORTALITY_PER_ENEMY = 0.01  # доп. смертность от войны (на год) за каждого врага
+WAR_MAX_EXTRA_MORTALITY = 0.03        # максимум доп. смертности от войн
+
+# Общественный строй (влияет на рождаемость/смертность)
+SOCIETY_TYPES = ("hunter_gatherer", "early_agrarian", "agrarian_empire", "proto_industrial")
+SOCIETY_FERTILITY_MULT = {
+    "hunter_gatherer": 0.8,
+    "early_agrarian": 1.1,
+    "agrarian_empire": 1.0,
+    "proto_industrial": 0.8,
+}
+SOCIETY_MORTALITY_MULT = {
+    "hunter_gatherer": 1.1,
+    "early_agrarian": 0.95,
+    "agrarian_empire": 1.0,
+    "proto_industrial": 0.9,
+}
+
+
+# =======================================
+# === 1. КЛАСС КЛЕТКИ ===================
 # =======================================
 
 @dataclass
@@ -20,79 +68,94 @@ class WorldCell:
     current_water_base: float = 0.0
 
     def __post_init__(self):
-        # Инициализируем динамические ресурсы базовыми
-        self.current_food_base = (self.properties.get("food_vegetal", 0) + self.properties.get("food_animal", 0))
+        self.current_food_base = (
+            self.properties.get("food_vegetal", 0) +
+            self.properties.get("food_animal", 0)
+        )
         self.current_water_base = self.properties.get("fresh_water", 0)
 
     @property
-    def is_land(self): return not self.properties.get("is_ocean", False)
+    def is_land(self):
+        return not self.properties.get("is_ocean", False)
+
     @property
-    def is_coastal(self): return self.properties.get("is_coastal", False) # Предполагаем, что это есть в biomes
-    
-    # Свойства теперь ссылаются на динамические ресурсы
+    def is_coastal(self):
+        return self.properties.get("is_coastal", False)
+
     @property
-    def food_availability(self): return self.current_food_base / 2
+    def food_availability(self):
+        return self.current_food_base / 2
+
     @property
-    def water_availability(self): return self.current_water_base
-    
+    def water_availability(self):
+        return self.current_water_base
+
     @property
-    def habitability(self): return self.properties.get("habitability", 0)
+    def habitability(self):
+        return self.properties.get("habitability", 0)
+
     @property
-    def movement_cost(self): return self.properties.get("movement_cost", 1.0)
+    def movement_cost(self):
+        return self.properties.get("movement_cost", 1.0)
+
     @property
-    def arable(self): return self.properties.get("arable_land", 1.0)
+    def arable(self):
+        return self.properties.get("arable_land", 1.0)
 
     def deplete(self, population):
-        """Истощает ресурсы от деятельности человека"""
         if self.is_land:
             depletion = population * RESOURCE_DEPLETION_RATE
             self.current_food_base = max(0.0, self.current_food_base - depletion)
 
     def regenerate(self):
-        """Медленно восстанавливает ресурсы до базовых"""
-        base_food = (self.properties.get("food_vegetal", 0) + self.properties.get("food_animal", 0))
+        base_food = (
+            self.properties.get("food_vegetal", 0) +
+            self.properties.get("food_animal", 0)
+        )
         if self.current_food_base < base_food:
-            self.current_food_base = min(base_food, self.current_food_base * (1 + RESOURCE_REGENERATION_RATE))
-        
+            self.current_food_base = min(
+                base_food,
+                self.current_food_base * (1 + RESOURCE_REGENERATION_RATE)
+            )
+
         base_water = self.properties.get("fresh_water", 0)
         if self.current_water_base < base_water:
-            self.current_water_base = min(base_water, self.current_water_base * (1 + RESOURCE_REGENERATION_RATE))
+            self.current_water_base = min(
+                base_water,
+                self.current_water_base * (1 + RESOURCE_REGENERATION_RATE)
+            )
 
 
 def load_world(filename, nx=None, ny=None):
     with open(filename) as f:
         raw = json.load(f)
     world = {}
-    
-    # --- 1. Первый проход: Создаем все ячейки ---
+
     for c in raw:
         props = BIOME_DATA.get(c["biome"], BIOME_DATA["Plains"]).copy()
-        world[(c["i"], c["j"])] = WorldCell(c["i"], c["j"], c["biome"], c["elevation_m"], props)
+        world[(c["i"], c["j"])] = WorldCell(
+            c["i"], c["j"], c["biome"], c["elevation_m"], props
+        )
 
-    # --- 2. Второй проход: Динамически вычисляем 'is_coastal' ---
     if nx is None or ny is None:
-        print("ПРЕДУПРЕЖДЕНИЕ: Размеры карты (nx, ny) не переданы, 'is_coastal' не будет вычислен.")
-        return world # Возвращаем как есть
+        print("ПРЕДУПРЕЖДЕНИЕ: nx/ny не заданы, 'is_coastal' не вычислен.")
+        return world
 
     print("Вычисление прибрежных зон...")
     for (i, j), cell in world.items():
-        # Нас интересует только 'суша'
         if cell.is_land:
-            # Проверяем 4 соседей
-            for di, dj in [(0,1), (0,-1), (1,0), (-1,0)]:
+            for di, dj in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 check_pos = ((i + di) % nx, (j + dj) % ny)
                 neighbor = world.get(check_pos)
-                
-                # Если сосед - океан, эта клетка - прибрежная
                 if neighbor and not neighbor.is_land:
                     cell.properties["is_coastal"] = True
-                    break # Достаточно одного соседа-океана
-    
+                    break
+
     return world
 
 
 # =======================================
-# === 2. БАЗОВЫЙ КЛАСС (Изменен) ========
+# === 2. БАЗОВЫЙ КЛАСС АГЕНТА ===========
 # =======================================
 
 class BaseEntity:
@@ -100,36 +163,33 @@ class BaseEntity:
         self.id = entity_id
         self.i, self.j = i, j
         self.population = int(population)
-        self.prev_population = population # Для проверки "сна"
+        self.prev_population = population
         self.food = max(50.0, population * 0.5)
         self.water = 0.7
         self.tech = start_tech
         self.age = 0
         self.stage = "base"
         self.alive = True
-        self.need_food_per_capita = 0.004
+        self.need_food_per_capita = 0.003
         self.hunger_level = 0.0
         self.thirst_level = 0.0
-        self.sleep_timer = 0 # Таймер "сна" для оптимизации
         self.sleep_timer = 0
 
-    # --- Сбор ресурсов (с истощением) ---
     def gather_resources(self, cell):
         if cell.is_land:
-            # Используем истощаемые ресурсы
-            base_food = (cell.food_availability + cell.arable * 0.6) * self.population * 0.0025
+            base_food = (cell.food_availability + cell.arable * 0.6) * self.population * 0.005
             tech_bonus = 1.0 + self.tech * 2.0
             self.food += base_food * tech_bonus
-            # Истощаем клетку
             cell.deplete(self.population)
         else:
             self.food += cell.properties.get("food_animal", 0) * self.population * 0.0008
 
-        self.water = max(0.0, min(1.0, self.water * 0.6 + cell.water_availability + random.uniform(0.0, 0.1)))
+        self.water = max(
+            0.0,
+            min(1.0, self.water * 0.6 + cell.water_availability + random.uniform(0.0, 0.1))
+        )
 
-    # --- Потребление (без изменений) ---
     def consume_resources(self, cell):
-        # (Код без изменений)
         need_food = self.population * self.need_food_per_capita
         if self.food >= need_food:
             self.food -= need_food * (1.0 - FOOD_WASTAGE_RATE)
@@ -137,93 +197,77 @@ class BaseEntity:
         else:
             deficit = need_food - self.food
             self.food = 0.0
-            self.hunger_level = max(0.0, min(1.0, deficit / (need_food + 1e-9)))
+            self.hunger_level = max(
+                0.0, min(1.0, deficit / (need_food + 1e-9))
+            )
         self.water = max(0.0, self.water - 0.15)
-        self.thirst_level = 0.0 if self.water >= 0.6 else max(0.0, min(1.0, (0.6 - self.water) / 0.6))
+        self.thirst_level = (
+            0.0 if self.water >= 0.6
+            else max(0.0, min(1.0, (0.6 - self.water) / 0.6))
+        )
 
-
-    # --- Рост технологий (без изменений) ---
     def tech_growth(self, cell):
-        # (Код без изменений)
         density_factor = min(1.0, self.population / (CARRYING_CAPACITY_FACTOR * 0.1))
         discovery_chance = TECH_DISCOVERY_CHANCE_BASE * (1 + density_factor * TECH_DENSITY_FACTOR)
         if random.random() < discovery_chance:
-            gain = 0.001 * (cell.habitability + cell.arable * 0.5)
+            # слегка усиленный прирост, чтобы к ~-15000 появлялись города
+            gain = 0.002 * (cell.habitability + cell.arable * 0.5)
             self.tech = min(1.0, self.tech + gain)
 
-    # --- Обновление популяции (единственное место с рождаемостью/смертностью) ---
     def update_population(self, cell):
         if not self.alive:
             return
 
-        # === ИЗМЕНЕНИЕ ЗДЕСЬ ===
-        
-        # 1. Базовая вместимость (от config)
-        base_capacity = CARRYING_CAPACITY_FACTOR 
-        
-        # 2. Бонус от технологий (сельское хозяйство, ирригация, инфраструктура)
-        # Технологии *экспоненциально* влияют на вместимость.
-        # (1 + 0.1*5) = 1.5x (раннее фермерство)
-        # (1 + 0.3*5) = 2.5x (развитое фермерство)
-        # (1 + 1.0*5) = 6.0x (промышленное с/х)
-        tech_capacity_multiplier = 1.0 + (self.tech * 5) 
-        
-        # 3. Бонус для Городов и Государств (торговля, логистика)
+        base_capacity = CARRYING_CAPACITY_FACTOR
+        tech_capacity_multiplier = 1.0 + (self.tech * 5)
+
         stage_multiplier = 1.0
-        if self.stage == 'city':
-             stage_multiplier = 2.0  # Города в 2 раза эффективнее племен
-        elif self.stage == 'state':
-             stage_multiplier = 5.0  # Гос-ва (макро-агент) еще эффективнее
-        
-        # Итоговая вместимость = База * Пригодность * Технологии * Бонус Стадии
-        carrying_capacity = max(1.0, (cell.habitability * base_capacity * tech_capacity_multiplier * stage_multiplier))
-        
-        # === КОНЕЦ ИЗМЕНЕНИЯ ===
+        if self.stage == "city":
+            stage_multiplier = 2.0
+        elif self.stage == "state":
+            stage_multiplier = 5.0
 
+        carrying_capacity = max(
+            1.0,
+            cell.habitability * base_capacity * tech_capacity_multiplier * stage_multiplier
+        )
 
-        # (Весь расчет growth_factor без изменений)
         base_birth = max(0.0, BIRTH_RATE_BASE * (cell.habitability + 0.2) * (1 + self.tech))
         base_death = max(0.0, DEATH_RATE_BASE * (1.0 - cell.habitability * 0.5))
         starvation_term = self.hunger_level * DEATH_RATE_STARVATION
         dehydration_term = self.thirst_level * (DEATH_RATE_STARVATION * 0.5)
-        
-        # 'overpop' теперь будет рассчитываться от *новой*, динамической 'carrying_capacity'
+
         overpop = max(0.0, (self.population / (carrying_capacity + 1e-9)) - 1.0)
         overpop_death = overpop * 0.04
-        
-        age_penalty = max(0.8, 1.0 - self.age / 20000) # (Используем мягкий штраф из прошлой итерации)
-        
+
+        age_penalty = max(0.8, 1.0 - self.age / 20000)
+
         yearly_birth = base_birth * age_penalty
         yearly_death = base_death + starvation_term + dehydration_term + overpop_death
-        
+
         years = max(1, SIMULATION_STEP_YEARS)
-        
+
         base_rate = 1.0 + yearly_birth - yearly_death
-        clamped_base_rate = max(0.0, base_rate) 
-        growth_factor = clamped_base_rate ** years
-        
-        pop_before = self.population
+        clamped_base_rate = max(0.0, base_rate)
+        growth_factor = clamped_base_rate ** years  # экспонента ок на уровне малых групп
+
         self.population = int(max(0, math.floor(self.population * growth_factor)))
 
         if self.population <= 0:
             self.alive = False
             return
 
-        # === ЛОГИКА СНА ===
         pop_growth = abs(self.population - self.prev_population) / (self.prev_population + 1e-9)
         if self.hunger_level < 0.1 and self.thirst_level < 0.1 and pop_growth < AGENT_STABLE_GROWTH_RATE:
             self.sleep_timer = AGENT_SLEEP_THRESHOLD_STEPS
-        
+
         self.prev_population = self.population
 
-
-    # --- Общий шаг (сигнатура изменена) ---
     def step(self, cell, world, debug=False):
-        """Сигнатура изменена: (self, cell, world, debug=False)"""
         if not self.alive:
             return
         self.age += SIMULATION_STEP_YEARS
-        
+
         self.gather_resources(cell)
         self.consume_resources(cell)
         self.update_population(cell)
@@ -242,7 +286,6 @@ class BaseEntity:
 
     @property
     def is_coastal(self, world):
-        """Проверяет, стоит ли агент на побережье"""
         cell = world.get((self.i, self.j))
         return cell and cell.is_coastal
 
@@ -250,70 +293,72 @@ class BaseEntity:
         return f"<{self.stage.capitalize()} #{self.id} pop={self.population} tech={self.tech:.3f} food={self.food:.1f}>"
 
 
-
 # =======================================
-# === 3. ГРУППА (Изменена) ==============
+# === 3. ГРУППА ========================
 # =======================================
 
 class HumanGroup(BaseEntity):
     def __init__(self, entity_id, i, j, population, start_tech=0.01, home_coord=None):
         super().__init__(entity_id, i, j, population, start_tech)
         self.stage = "group"
-        self.food = 300.0 
+        self.food = 500.0
         self.path = [(i, j)]
         self.is_migrating = True
         self.steps_migrating = 0
         self.next_pos = None
-        # Запоминаем "дом", чтобы уйти от него
         self.home_coord = home_coord if home_coord else (i, j)
 
     def absorb(self, other_entity):
-        """Поглощает другую группу"""
-        # (Используется, если эта группа "выиграла" клетку)
         self.population += other_entity.population
         self.food += other_entity.food
         self.tech = max(self.tech, other_entity.tech)
         other_entity.alive = False
 
     def _distance_from_home(self, i, j):
-        """Helper: Считает 'шаговое' расстояние от дома (дистанция Чебышева)"""
         if not self.home_coord:
             return 0
         return max(abs(i - self.home_coord[0]), abs(j - self.home_coord[1]))
-    
-    def choose_next_direction(self, world):
-        """
-        Более реалистичная логика миграции:
-        - стремимся уйти от дома;
-        - предпочитаем более пригодные для жизни клетки;
-        - сохраняем общее направление (инерция);
-        - избегаем топтания на месте.
-        """
-        if not hasattr(self, "direction"):
-            self.direction = (random.choice([-1, 0, 1]), random.choice([-1, 0, 1]))
 
-        dirs = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if not (dx == 0 and dy == 0)]
+    def choose_next_direction(self, world):
+        if not hasattr(self, "direction"):
+            self.direction = (
+                random.choice([-1, 0, 1]),
+                random.choice([-1, 0, 1])
+            )
+
+        dirs = [
+            (dx, dy)
+            for dx in [-1, 0, 1]
+            for dy in [-1, 0, 1]
+            if not (dx == 0 and dy == 0)
+        ]
         best_pos, best_score = None, -999
         current_dist = self._distance_from_home(self.i, self.j)
 
+        recent_tail = set(self.path[-5:])
+
         for dx, dy in dirs:
             nx, ny = self.i + dx, self.j + dy
-            if (nx, ny) in self.path[-5:]:
+            if (nx, ny) in recent_tail:
                 continue
             cell = world.get((nx, ny))
             if not cell or not cell.is_land:
                 continue
 
-            # 1. Увеличение расстояния от дома
             dist_score = (self._distance_from_home(nx, ny) - current_dist) * 0.6
+            terrain_score = (
+                cell.habitability * 0.7 +
+                cell.arable * 0.5 +
+                cell.food_availability * 0.3
+            )
 
-            # 2. Пригодность местности
-            terrain_score = (cell.habitability * 0.7 + cell.arable * 0.5 + cell.food_availability * 0.3)
+            if (dx, dy) == self.direction:
+                dir_alignment = 1.0
+            elif dx * dy == 0:
+                dir_alignment = 0.5
+            else:
+                dir_alignment = 0.3
 
-            # 3. Инерция — предпочтение прежнего направления
-            dir_alignment = 1.0 if (dx, dy) == self.direction else 0.5 if (dx*dy == 0) else 0.3
-
-            # 4. Небольшая случайность
             random_bonus = random.uniform(-0.2, 0.2)
 
             score = dist_score + terrain_score + dir_alignment + random_bonus
@@ -321,51 +366,39 @@ class HumanGroup(BaseEntity):
             if score > best_score:
                 best_score, best_pos = score, (nx, ny)
 
-        # обновляем направление
         if best_pos:
             self.direction = (best_pos[0] - self.i, best_pos[1] - self.j)
 
         return best_pos
 
-    
     def gather_resources_migrant(self, cell):
-        """Упрощенный сбор (собирательство/охота на ходу)"""
-        # Собирают в 10 раз меньше, чем оседлое племя
         if cell.is_land:
-            base_food = (cell.food_availability + cell.arable * 0.2) * self.population * 0.0003
+            base_food = (cell.food_availability * 0.7 + cell.arable * 0.5) * self.population * 0.004
             tech_bonus = 1.0 + self.tech
             self.food += base_food * tech_bonus
-            cell.deplete(self.population * 0.1) # Истощают, но меньше
+            cell.deplete(self.population * 0.1)
 
-        self.water = max(0.0, min(1.0, self.water * 0.8 + cell.water_availability + random.uniform(0.0, 0.1)))
-    
+        self.water = max(
+            0.0,
+            min(1.0, self.water * 0.8 + cell.water_availability + random.uniform(0.0, 0.1))
+        )
+
     def update_population_migrant(self):
-        """
-        Демография кочевой группы:
-        - может немного расти, если обеспечена едой и водой;
-        - голод/жажда дают высокую смертность;
-        - возраст не учитывается, так как это "молодые" мигранты.
-        """
         if not self.alive:
             return
 
-        # --- Базовые коэффициенты ---
-        base_birth = BIRTH_RATE_BASE * 0.5  # кочевники размножаются медленнее
-        base_death = DEATH_RATE_BASE * 0.8  # немного ниже (молодые, мобильные)
-        
-        # --- Влияние состояния ---
-        # Если еды и воды хватает — повышаем рождаемость
-        resource_factor = (self.food / (self.population * self.need_food_per_capita * 100 + 1e-9))
-        if resource_factor > 1.0:
-            base_birth *= min(2.0, resource_factor)  # максимум ×2
-        elif resource_factor < 0.5:
-            base_birth *= resource_factor            # меньше еды — меньше рождаемость
+        base_birth = BIRTH_RATE_BASE * 0.5
+        base_death = DEATH_RATE_BASE * 0.8
 
-        # --- Стресс от голода и жажды ---
+        resource_factor = self.food / (self.population * self.need_food_per_capita * 100 + 1e-9)
+        if resource_factor > 1.0:
+            base_birth *= min(2.0, resource_factor)
+        elif resource_factor < 0.5:
+            base_birth *= resource_factor
+
         starvation_term = self.hunger_level * DEATH_RATE_STARVATION
         dehydration_term = self.thirst_level * (DEATH_RATE_STARVATION * 0.5)
 
-        # --- Итоговые ставки ---
         yearly_birth = base_birth
         yearly_death = base_death + starvation_term + dehydration_term
 
@@ -379,247 +412,195 @@ class HumanGroup(BaseEntity):
         if self.population <= 0:
             self.alive = False
 
-
     def step(self, cell, world, debug=False):
-        """
-        Шаг с "реакцией" на плохую клетку
-        """
-        if not self.alive: return None
+        if not self.alive:
+            return None
         if not cell or not cell.is_land:
             self.alive = False
             return None
-            
-        self.next_pos = None # Сбрасываем заявку на ход
 
-        # === НОВАЯ ЛОГИКА: РЕАКЦИЯ НА КЛЕТКУ ===
-        # (Мы уже *вошли* в эту клетку в прошлом шаге)
-        
-        # Оцениваем, насколько плохая клетка
-        # cell_quality = cell.habitability + cell.food_availability
-        
-        # # 0.25 - это "очень плохая" (пустыня, ледник)
-        # if cell_quality < 0.25 and len(self.path) > 1:
-        #     # Шанс 50% "испугаться" и отступить
-        #     if random.random() < 0.5:
-        #         last_pos = self.path[-2] # [-1] - это *текущая* клетка
-        #         self.next_pos = last_pos
-        #         if debug:
-        #             print(f"  [Отступление] Группа #{self.id} отступает из {cell.biome} в {last_pos}")
-        #         return None # Пропускаем остаток шага (еду, смерть и т.д.)
-        # === КОНЕЦ НОВОЙ ЛОГИКИ ===
-
+        self.next_pos = None
         self.age += SIMULATION_STEP_YEARS
 
-        # 1. Упрощенная жизнь мигранта
         self.gather_resources_migrant(cell)
         self.consume_resources(cell)
-        self.update_population_migrant() # (Используем твой "исправленный" migrant_pop)
+        self.update_population_migrant()
 
-        if not self.alive: # Умерли в пути
+        if not self.alive:
             return None
 
-        # 2. Обновляем таймер "иммунитета"
         self.steps_migrating += 1
         if self.steps_migrating > MIGRATION_IMMUNITY_STEPS:
             self.is_migrating = False
 
-        # 3. Эволюция в племя (если нашли хорошее место и выжили)
         evolve_cf = cell.arable * cell.habitability
         if self.population > TRIBE_FOUNDING_THRESHOLD and evolve_cf > 0.4 and not self.is_migrating:
             if debug:
                 print(f"  [Эволюция] Группа #{self.id} основала племя в ({self.i},{self.j})")
-            tribe = Tribe(self.id, self.i, self.j, self.population, start_tech=self.tech) 
-            self.alive = False 
-            return tribe 
+            tribe = Tribe(self.id, self.i, self.j, self.population, start_tech=self.tech)
+            self.alive = False
+            return tribe
 
-        # 4. Движение
         new_pos = self.choose_next_direction(world)
         if new_pos:
-            self.next_pos = new_pos 
+            self.next_pos = new_pos
         else:
-            # Некуда идти, вынужденно оседаем
             self.is_migrating = False
-        
-        # 5. Превращение в мореплавателей, если достигли побережья и технологий
+
         if cell.is_coastal and self.tech >= SEAFARING_TECH_THRESHOLD and random.random() < 0.5:
             if debug:
                 print(f"  [Эволюция] Группа #{self.id} ({self.i},{self.j}) стала мореплавателями (tech={self.tech:.3f})")
             self.alive = False
             return SeafaringGroup(self.id, self.i, self.j, self.population, start_tech=self.tech)
-            
+
         return None
 
 
 # =======================================
-# === 4. ПЛЕМЯ (Изменено) ===============
+# === 4. ПЛЕМЯ ==========================
 # =======================================
 
 class Tribe(BaseEntity):
-    def __init__(self, entity_id, i, j, population, start_tech=0.05): 
-        super().__init__(entity_id, i, j, population, start_tech) 
+    def __init__(self, entity_id, i, j, population, start_tech=0.05):
+        super().__init__(entity_id, i, j, population, start_tech)
         self.stage = "tribe"
         self.food = 300.0
-    
+
     def absorb(self, other_entity):
-        """Поглощает другую сущность (группу или племя)"""
         self.population += other_entity.population
         self.food += other_entity.food
         self.tech = max(self.tech, other_entity.tech)
         other_entity.alive = False
-        # print(f"  [Агрегация] Племя #{self.id} поглотило сущность #{other_entity.id}")
 
     def find_spawn_location(self, world):
-        """Ищет безопасную соседнюю клетку для спавна мигрантов"""
-        dirs = [(1,0),(-1,0),(0,1),(-1,0),(1,1),(-1,-1),(1,-1),(-1,1)]
+        dirs = [(1, 0), (-1, 0), (0, 1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1)]
         random.shuffle(dirs)
-        
+
         for dx, dy in dirs:
             nx, ny = self.i + dx, self.j + dy
             cell = world.get((nx, ny))
-            # Ищем любую соседнюю *сушу*
             if cell and cell.is_land:
-                return (nx, ny) 
-        
-        # Если мы на острове 1x1, миграция невозможна
+                return (nx, ny)
         return None
-    
+
     def get_stress_level(self, cell):
-        """
-        Расчет "уровня стресса" для миграции (0..1+)
-        ИСПОЛЬЗУЕТ "МЯГКИЙ" ПРЕДЕЛ ИЗ КОНФИГА
-        """
-        # "Мягкая" вместимость (для миграции), ИЗ CONFIG
-        migration_capacity = max(1.0, cell.habitability * CELL_CAPACITY_SCALE) 
+        migration_capacity = max(1.0, cell.habitability * CELL_CAPACITY_SCALE)
         population_ratio = self.population / migration_capacity
-        
-        # Стресс от перенаселения НАЧИНАЕТСЯ после порога (из config)
         overpop_stress = max(0.0, population_ratio - OVERPOPULATION_THRESHOLD)
-        
-        # Итоговый стресс = Голод + Перенаселение.
         stress = self.hunger_level + overpop_stress
         return stress
 
     def step(self, cell, world, debug=False):
-        if not self.alive: return None
+        if not self.alive:
+            return None
         if not cell or not cell.is_land:
             self.alive = False
             return None
 
         super().step(cell, world, debug)
-        
-        # 1. Эволюция в Город
-        if self.population > CITY_FOUNDING_THRESHOLD and self.tech > 0.1:
+
+        if self.population > CITY_FOUNDING_THRESHOLD and self.tech > 0.08:
+            # немного снижен tech-порог для появления городов к ~-15000
             if debug:
                 print(f"  [Эволюция] Племя #{self.id} стало городом ({self.i},{self.j})")
-            self.alive = False 
+            self.alive = False
             return City(self.id, self.i, self.j, self.population, start_tech=self.tech)
 
-        # 2. Миграция (сухопутная)
         stress = self.get_stress_level(cell)
-        if stress > MIGRATION_STRESS_THRESHOLD and self.population > 100 and random.random() < 0.1: # <--- Твой код с random
+        if stress > MIGRATION_STRESS_THRESHOLD and self.population > 100 and random.random() < 0.1:
             new_pop = int(self.population * MIGRATION_PERCENTAGE)
-            if new_pop > 50: 
+            if new_pop > 50:
                 spawn_pos = self.find_spawn_location(world)
-                if not spawn_pos: # Некуда "вытолкнуть" группу (например, остров 1x1)
-                    return None # Миграция не удалась
-                
-                migrant_tech = self.tech * 0.8 
-                # Создаем группу в *соседней* клетке
-                new_group = HumanGroup(random.randint(10000, 99999), *spawn_pos, new_pop, 
-                                   start_tech=migrant_tech, home_coord=(self.i, self.j))
+                if not spawn_pos:
+                    return None
+
+                migrant_tech = self.tech * 0.8
+                new_group = HumanGroup(
+                    random.randint(10000, 99999),
+                    *spawn_pos,
+                    new_pop,
+                    start_tech=migrant_tech,
+                    home_coord=(self.i, self.j)
+                )
                 self.population -= new_pop
                 if debug:
                     print(f"  [Миграция] Племя #{self.id} (стресс={stress:.2f}) породило группу #{new_group.id} (tech={migrant_tech:.3f})")
-                return new_group 
-        
+                return new_group
+
         return None
 
 
 # =======================================
-# === 5. ГОРОД (Изменен) ================
+# === 5. ГОРОД ==========================
 # =======================================
 
 class City(BaseEntity):
-    def __init__(self, entity_id, i, j, population, start_tech=0.2): 
-        super().__init__(entity_id, i, j, population, start_tech) 
+    def __init__(self, entity_id, i, j, population, start_tech=0.2):
+        super().__init__(entity_id, i, j, population, start_tech)
         self.stage = "city"
         self.food = 1000.0
         self.influence_radius = CITY_INFLUENCE_RADIUS
 
     def get_stress_level(self, cell):
-        """
-        Расчет "уровня стресса" для миграции (0..1+)
-        ИСПОЛЬЗUЕТ "МЯГКИЙ" ПРЕДЕЛ ИЗ КОНФИГА
-        (Логика идентична Tribe.get_stress_level)
-        """
-        # "Мягкая" вместимость (для миграции), ИЗ CONFIG
-        migration_capacity = max(1.0, cell.habitability * CELL_CAPACITY_SCALE) 
+        migration_capacity = max(1.0, cell.habitability * CELL_CAPACITY_SCALE)
         population_ratio = self.population / migration_capacity
-        
-        # Стресс от перенаселения НАЧИНАЕТСЯ после порога (из config)
         overpop_stress = max(0.0, population_ratio - OVERPOPULATION_THRESHOLD)
-        
-        # Итоговый стресс = Голод + Перенаселение.
         stress = self.hunger_level + overpop_stress
         return stress
 
     def find_spawn_location(self, world):
-        """Ищет безопасную соседнюю клетку для спавна мигрантов"""
-        dirs = [(1,0),(-1,0),(0,1),(-1,0),(1,1),(-1,-1),(1,-1),(-1,1)]
+        dirs = [(1, 0), (-1, 0), (0, 1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1)]
         random.shuffle(dirs)
-        
+
         for dx, dy in dirs:
             nx, ny = self.i + dx, self.j + dy
             cell = world.get((nx, ny))
-            # Ищем любую соседнюю *сушу*
             if cell and cell.is_land:
-                return (nx, ny) 
-        
-        # Если мы на острове 1x1, миграция невозможна
+                return (nx, ny)
         return None
-    
+
     def absorb(self, other_entity):
-        """Поглощает другую сущность (группу или племя)"""
-        # (Код из твоего absorb(tribe) просто обобщен)
         self.population += other_entity.population
         self.food += other_entity.food
         self.tech = max(self.tech, other_entity.tech)
         other_entity.alive = False
-        # print(f"  [Агрегация] Город #{self.id} поглотил сущность #{other_entity.id}")
 
     def step(self, cell, world, debug=False):
-        if not self.alive: return None
-        if not cell: 
+        if not self.alive:
+            return None
+        if not cell:
             self.alive = False
             return None
-            
-        super().step(cell, world, debug)
-        
-        # Эволюция в Государство обрабатывается в Simulation.step()
 
-        # Миграция (сухопутная)
+        super().step(cell, world, debug)
+
         stress = self.get_stress_level(cell)
-        if stress > MIGRATION_STRESS_THRESHOLD and self.population > 1000 and random.random() < 0.1: # <--- Твой код с random
-            new_pop = int(self.population * MIGRATION_PERCENTAGE * 0.5) 
+        if stress > MIGRATION_STRESS_THRESHOLD and self.population > 1000 and random.random() < 0.1:
+            new_pop = int(self.population * MIGRATION_PERCENTAGE * 0.5)
             if new_pop > 100:
                 spawn_pos = self.find_spawn_location(world)
-                if not spawn_pos: 
-                    return None 
-                
+                if not spawn_pos:
+                    return None
+
                 migrant_tech = self.tech * 0.8
-                # Создаем группу в *соседней* клетке
-                new_group = HumanGroup(random.randint(10000, 99999), *spawn_pos, new_pop, 
-                                   start_tech=migrant_tech, home_coord=(self.i, self.j))
-                
+                new_group = HumanGroup(
+                    random.randint(10000, 99999),
+                    *spawn_pos,
+                    new_pop,
+                    start_tech=migrant_tech,
+                    home_coord=(self.i, self.j)
+                )
+
                 self.population -= new_pop
                 if debug:
-                     print(f"  [Миграция] Город #{self.id} (стресс={stress:.2f}) породил группу #{new_group.id} в {spawn_pos}")
+                    print(f"  [Миграция] Город #{self.id} (стресс={stress:.2f}) породил группу #{new_group.id} в {spawn_pos}")
                 return new_group
+
         return None
 
 
 # =======================================
-# === 6. МОРЕПЛАВАТЕЛИ (Новый) =========
+# === 6. МОРЕПЛАВАТЕЛИ ==================
 # =======================================
 
 class SeafaringGroup(BaseEntity):
@@ -630,31 +611,39 @@ class SeafaringGroup(BaseEntity):
         self.water = 0.9
         self.need_food_per_capita = 0.003
         self.steps_at_sea = 0
-        self.ignore_land_steps = 8  # 🔹 первые 8 шагов не возвращаемся к берегу
-        self.direction = random.choice([(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,-1),(1,-1),(-1,1)])
+        self.ignore_land_steps = 8
+        self.direction = random.choice([
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (-1, -1), (1, -1), (-1, 1)
+        ])
+        self.origin_land = (i, j)      # чтобы понимать, куда не возвращаться
+        self.ignore_land_steps = 15     # чтобы оторваться от родного берега
+        self.ocean_age = 0              # сколько ходов в океане
+        self.direction = random.choice([(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)])
+        self.last_direction = self.direction
+
+
+    def dist_from_origin(self, x=None, y=None):
+        if x is None: x = self.i
+        if y is None: y = self.j
+        ox, oy = self.origin_land
+        return max(abs(x - ox), abs(y - oy))
+
 
     def update_population_seafaring(self):
-        """
-        Упрощенная демография для моряков. 
-        НЕТ "overpopulation_death". Смерть только от голода и тягот пути.
-        (Скопировано из HumanGroup)
-        """
         if not self.alive:
             return
 
-        # В пути нет чистого прироста, только базовая смертность и стресс
-        yearly_birth = DEATH_RATE_BASE 
+        yearly_birth = DEATH_RATE_BASE
         yearly_death = DEATH_RATE_BASE
-        
-        # Стресс от голода и жажды
+
         starvation_term = self.hunger_level * DEATH_RATE_STARVATION
         dehydration_term = self.thirst_level * (DEATH_RATE_STARVATION * 0.5)
 
         years = max(1, SIMULATION_STEP_YEARS)
-        
-        # Расчет базы БЕЗ 'overpop_death' и БЕЗ 'age_penalty'
+
         base_rate = 1.0 + yearly_birth - (yearly_death + starvation_term + dehydration_term)
-        clamped_base_rate = max(0.0, base_rate) 
+        clamped_base_rate = max(0.0, base_rate)
         growth_factor = clamped_base_rate ** years
 
         self.population = int(max(0, math.floor(self.population * growth_factor)))
@@ -663,121 +652,457 @@ class SeafaringGroup(BaseEntity):
             self.alive = False
 
     def gather_resources(self, cell):
-        """Рыбалка в океане"""
         self.food += cell.properties.get("food_animal", 0) * self.population * 0.0005
-        # Вода только тратится
-        self.water = max(0.0, self.water - 0.05) 
+        self.water = max(0.0, self.water - 0.05)
 
     def choose_next_direction(self, world):
-        """Плавание с инерцией и временным игнорированием суши"""
-        self.steps_at_sea += 1
+        self.ocean_age += 1
+        current_dist = self.dist_from_origin()
 
-        # Пока не истёк "игнор суши" — плывём по инерции
-        if self.steps_at_sea < self.ignore_land_steps:
-            nx, ny = self.i + self.direction[0], self.j + self.direction[1]
+        # 1. Первые шаги — ИГНОРИРУЕМ сушу, чтобы оторваться от материка
+        if self.ocean_age <= self.ignore_land_steps:
+            nx = self.i + self.direction[0]
+            ny = self.j + self.direction[1]
             cell = world.get((nx, ny))
             if cell and not cell.is_land:
+                self.last_direction = self.direction
                 return (nx, ny)
 
-        # Ищем землю только после того, как уплыли достаточно далеко
-        best_land_pos = None
-        min_dist = SEAFARING_LAND_SENSE_RADIUS + 1
-        for r in range(1, SEAFARING_LAND_SENSE_RADIUS + 1):
+        # 2. Радиус поиска суши (растёт с технологией)
+        radius = 2
+        if self.tech >= 0.2:
+            radius = 6
+        if self.tech >= 0.35:
+            radius = 12
+        if self.tech >= 0.45:
+            radius = 20  # РЕАЛЬНОЕ океанское исследование
+
+        # 3. Ищем сушу, но с учётом расстояния от материка
+        best_target = None
+        best_score = -999
+
+        for r in range(1, radius + 1):
             for dx in range(-r, r + 1):
                 for dy in range(-r, r + 1):
                     if dx == 0 and dy == 0:
                         continue
-                    nx, ny = self.i + dx, self.j + dy
-                    cell = world.get((nx, ny))
-                    if cell and cell.is_land:
-                        dist = max(abs(dx), abs(dy))
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_land_pos = (self.i + (1 if dx > 0 else -1 if dx < 0 else 0),
-                                             self.j + (1 if dy > 0 else -1 if dy < 0 else 0))
-            if best_land_pos:
-                # не сразу к суше — шанс 50% "игнорировать" её
-                if random.random() < 0.5:
-                    continue
-                self.direction = (best_land_pos[0] - self.i, best_land_pos[1] - self.j)
-                return best_land_pos
 
-        # иначе — случайное дрейфование с инерцией
-        dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,-1),(1,-1),(-1,1)]
+                    tx = self.i + dx
+                    ty = self.j + dy
+                    cell = world.get((tx, ty))
+
+                    if not cell or not cell.is_land:
+                        continue
+
+                    # шаг в сторону суши
+                    step_x = self.i + (1 if dx > 0 else -1 if dx < 0 else 0)
+                    step_y = self.j + (1 if dy > 0 else -1 if dy < 0 else 0)
+
+                    # если суша — родная → отвергаем
+                    if self.dist_from_origin(step_x, step_y) < current_dist + 12:
+                        continue
+
+                    # оценка
+                    score = -r * 0.2 + self.dist_from_origin(step_x, step_y) * 0.5
+
+                    if score > best_score:
+                        best_score = score
+                        best_target = (step_x, step_y)
+
+        # 4. Если сушу нашли
+        if best_target and random.random() < 0.85:
+            dx = best_target[0] - self.i
+            dy = best_target[1] - self.j
+            self.direction = (dx, dy)
+            self.last_direction = self.direction
+            return best_target
+
+        # 5. Глубокий океан — сохраняем курс
+        if random.random() < 0.1:
+            # небольшая случайность
+            dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+            self.direction = random.choice(dirs)
+
+        nx = self.i + self.direction[0]
+        ny = self.j + self.direction[1]
+        cell = world.get((nx, ny))
+
+        if cell and not cell.is_land:
+            self.last_direction = self.direction
+            return (nx, ny)
+
+        # fallback
+        dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(1,1),(-1,-1)]
         random.shuffle(dirs)
         for dx, dy in dirs:
-            nx, ny = self.i + dx, self.j + dy
+            nx = self.i + dx
+            ny = self.j + dy
             cell = world.get((nx, ny))
             if cell and not cell.is_land:
                 self.direction = (dx, dy)
+                self.last_direction = (dx, dy)
                 return (nx, ny)
 
         return None
 
+
     def step(self, cell, world, debug=False):
-        if not self.alive: return None
-        
-        # 1. Мы приплыли!
+        if not self.alive:
+            return None
+
         if cell.is_land:
             self.alive = False
             if debug:
                 print(f"  [Колонизация] Группа #{self.id} высадилась в ({self.i},{self.j})!")
-            # Превращаемся в обычную группу мигрантов
             return HumanGroup(self.id, self.i, self.j, self.population, self.tech)
 
-        # 2. Мы еще в море
-        # super().step() тут не подходит, т.к. другая логика
         self.age += SIMULATION_STEP_YEARS
         self.gather_resources(cell)
-        self.consume_resources(cell) # Тратим еду/воду
-        self.update_population_seafaring() # Люди могут умирать в пути
+        self.consume_resources(cell)
+        self.update_population_seafaring()
 
-        if not self.alive: # Погибли в море
-            if debug: print(f"  [Потеря] Группа #{self.id} погибла в океане.")
+        if not self.alive:
+            if debug:
+                print(f"  [Потеря] Группа #{self.id} погибла в океане.")
             return None
 
         new_pos = self.choose_next_direction(world)
         if new_pos:
             self.move_to(*new_pos)
         else:
-            self.alive = False # Застряли (например, в озере)
-            
+            self.alive = False
+
         return None
 
 
 # =======================================
-# === 7. ГОСУДАРСТВО (Новый) ===========
+# === 7. ГОСУДАРСТВО ====================
 # =======================================
 
 class State:
-    """Макро-агент, не наследуется от BaseEntity!"""
+    """Макро-агент (гос-во), с демографией, войнами и дипломатией."""
     def __init__(self, entity_id, i, j, population, tech):
         self.id = entity_id
-        self.i, self.j = i, j # Столица
+        self.i, self.j = i, j  # столица
         self.population = int(population)
         self.tech = tech
         self.age = 0
         self.alive = True
         self.stage = "state"
-        self.territory = set() # Набор (i, j) всех клеток
-        self.cities_coords = [] # Координаты (i, j)
-        self.is_coastal = False # Есть ли выход к морю
+        self.territory = set()
+        self.cities_coords = []
+        self.is_coastal = False
         self.need_food_per_capita = 0.004
-        self.expansion_budget = 0.0 # <--- ДОБАВИТЬ "ОЧКИ ВЛИЯНИЯ"
+        self.expansion_budget = 0.0
+
+        # Дипломатия
+        self.relations = {}
+        self.war_exhaustion = 0.0
+        self.at_war = set()
+        self.allies = set()
+        self.relations_initialized = False
+
+        # Баланс сил
+        self.military_power = 0.0
+        self.is_great_power = False
+
+        # Вассалитет
+        self.vassals = set()
+        self.overlord_id = None
+        self.vassal_loyalty = 1.0
+
+        # Демография (пирамида)
+        self.pop_children = 0
+        self.pop_adults = 0
+        self.pop_elderly = 0
+        self.demography_initialized = False
+        self.society_type = "hunter_gatherer"
+
+        # Эпидемии и голод
+        self.epidemic_severity = 0.0  # 0..1
+        self.years_of_famine = 0.0    # накопленный голод
+
+    # ===== Вспомогательные методы демографии =====
+
+    def _reset_demography_from_total(self):
+        """Начальная возрастная структура по текущему населению."""
+        if self.population <= 0:
+            self.pop_children = self.pop_adults = self.pop_elderly = 0
+            return
+        c = int(self.population * 0.35)
+        e = int(self.population * 0.08)
+        a = self.population - c - e
+        if a < 0:
+            a = 0
+        self.pop_children = c
+        self.pop_adults = a
+        self.pop_elderly = e
+
+    def _ensure_demography(self):
+        if not self.demography_initialized:
+            self._reset_demography_from_total()
+            self.demography_initialized = True
+
+    def _update_society_type(self, n_cells, avg_habitability):
+        """Очень упрощённый общественный строй по тех. и масштабу."""
+        if self.tech < 0.15:
+            self.society_type = "hunter_gatherer"
+        elif self.tech < 0.3 and n_cells < 50:
+            self.society_type = "early_agrarian"
+        elif self.tech < 0.6:
+            self.society_type = "agrarian_empire"
+        else:
+            self.society_type = "proto_industrial"
+
+    def _update_epidemic_and_famine(self, food_surplus_ratio, n_cells):
+        """Обновляем эпидемии и голод на уровне государства."""
+        # Голод
+        if food_surplus_ratio < FAMINE_FOOD_DEFICIT_THRESHOLD:
+            self.years_of_famine += SIMULATION_STEP_YEARS
+        else:
+            self.years_of_famine = max(0.0, self.years_of_famine - SIMULATION_STEP_YEARS)
+
+        # Эпидемии: шанс растёт с населением и плотностью
+        density = self.population / max(1.0, n_cells * CELL_CAPACITY_SCALE)
+        if self.epidemic_severity > 0.0:
+            self.epidemic_severity = max(
+                0.0,
+                self.epidemic_severity - EPIDEMIC_DECAY_PER_STEP
+            )
+        else:
+            if (
+                self.population > EPIDEMIC_POP_THRESHOLD and
+                density > 0.5 and
+                random.random() < EPIDEMIC_BASE_CHANCE * (1.0 + density * EPIDEMIC_DENSITY_FACTOR)
+            ):
+                self.epidemic_severity = random.uniform(0.2, 0.7)
+                # print(f"☠ Эпидемия в государстве {self.id}, тяжесть={self.epidemic_severity:.2f}")
+
+    def _demographic_step(self, years, K, food_surplus_ratio):
+        """
+        Линейно-логистическая демография:
+        - рождаемость зависит от общества, еды и перенаселения
+        - смертность зависит от возраста, голода, эпидемий, войн
+        """
+        self._ensure_demography()
+        total_pop = self.pop_children + self.pop_adults + self.pop_elderly
+        if total_pop <= 0:
+            self.population = 0
+            self.alive = False
+            return
+
+        # Логистический фактор (1 - P/K), ограничиваем [-1, 1]
+        logistic_factor = 1.0 - total_pop / (K + 1e-9)
+        logistic_factor = max(-1.0, min(1.0, logistic_factor))
+
+        # Общественный строй
+        fert_mult = SOCIETY_FERTILITY_MULT.get(self.society_type, 1.0)
+        mort_mult = SOCIETY_MORTALITY_MULT.get(self.society_type, 1.0)
+
+        # Голод
+        famine_severity = min(1.5, self.years_of_famine / FAMINE_YEARS_SCALE)
+        famine_birth_mult = max(0.0, 1.0 - FAMINE_BIRTH_REDUCTION * famine_severity)
+        famine_mort_add = FAMINE_EXTRA_MORTALITY * famine_severity
+
+        # Эпидемия
+        epi = self.epidemic_severity
+        epidemic_mort_add = EPIDEMIC_MORTALITY_MULT * epi
+
+        # Война
+        war_factor = min(
+            WAR_MAX_EXTRA_MORTALITY,
+            WAR_EXTRA_MORTALITY_PER_ENEMY * len(self.at_war)
+        )
+
+        # Логистика: при перенаселении снижаем рождаемость и повышаем смертность
+        if logistic_factor < 0:
+            fertility_logistic_mult = max(0.0, 1.0 + logistic_factor)  # до 0 при сильном перенаселении
+            overpop_mort_add = -logistic_factor * 0.01
+        else:
+            fertility_logistic_mult = 1.0 + 0.2 * logistic_factor
+            overpop_mort_add = 0.0
+
+        # Итоговые коэффициенты
+        annual_birth_rate = (
+            STATE_BASE_FERTILITY *
+            fert_mult *
+            famine_birth_mult *
+            fertility_logistic_mult
+        )
+        annual_birth_rate = max(0.0, min(0.12, annual_birth_rate))  # защита от странных значений
+
+        child_mort = (
+            STATE_CHILD_MORTALITY * mort_mult +
+            famine_mort_add + epidemic_mort_add + overpop_mort_add + war_factor
+        )
+        adult_mort = (
+            STATE_ADULT_MORTALITY * mort_mult +
+            famine_mort_add + epidemic_mort_add + overpop_mort_add + war_factor
+        )
+        elder_mort = (
+            STATE_ELDER_MORTALITY * mort_mult +
+            famine_mort_add + epidemic_mort_add + overpop_mort_add + war_factor
+        )
+
+        # Ограничения (пер-год)
+        child_mort = max(0.0, min(0.5, child_mort))
+        adult_mort = max(0.0, min(0.3, adult_mort))
+        elder_mort = max(0.0, min(0.8, elder_mort))
+
+        # Рождения (от взрослых)
+        births = int(self.pop_adults * annual_birth_rate * years)
+
+        # Старение
+        children_to_adults = int(self.pop_children * (years / CHILD_YEARS))
+        adults_to_elderly = int(self.pop_adults * (years / ADULT_YEARS))
+
+        children_to_adults = min(self.pop_children, children_to_adults)
+        adults_to_elderly = min(self.pop_adults, adults_to_elderly)
+
+        # Смертность
+        deaths_children = int(self.pop_children * child_mort * years)
+        deaths_adults = int(self.pop_adults * adult_mort * years)
+        deaths_elderly = int(self.pop_elderly * elder_mort * years)
+
+        deaths_children = min(self.pop_children, deaths_children)
+        deaths_adults = min(self.pop_adults, deaths_adults)
+        deaths_elderly = min(self.pop_elderly, deaths_elderly)
+
+        # Обновляем группы
+        new_children = self.pop_children + births - children_to_adults - deaths_children
+        new_adults = self.pop_adults + children_to_adults - adults_to_elderly - deaths_adults
+        new_elderly = self.pop_elderly + adults_to_elderly - deaths_elderly
+
+        self.pop_children = max(0, new_children)
+        self.pop_adults = max(0, new_adults)
+        self.pop_elderly = max(0, new_elderly)
+
+        self.population = self.pop_children + self.pop_adults + self.pop_elderly
+
+        if self.population <= 0:
+            self.alive = False
+
+    # ===== Дипломатия и войны =====
+
+    def init_relations(self, other_states):
+        for s in other_states:
+            if s.id == self.id:
+                continue
+            if s.id not in self.relations:
+                val = random.uniform(-10, 10)
+                self.relations[s.id] = val
+                s.relations[self.id] = val
+
+    def decay_relations(self):
+        for sid in list(self.relations.keys()):
+            self.relations[sid] *= (1 - RELATION_DECAY * 0.01)
+
+    def check_war_state(self, other):
+        rel = self.relations.get(other.id, 0.0)
+        if other.id in self.allies:
+            return
+        if other.id in self.at_war:
+            return
+        if rel < WAR_THRESHOLD:
+            self.start_war(other)
+
+    def try_make_peace(self, other):
+        rel = self.relations.get(other.id, 0.0)
+        if rel > PEACE_THRESHOLD or self.war_exhaustion > 5:
+            if other.id in self.at_war:
+                self.at_war.discard(other.id)
+                other.at_war.discard(self.id)
+                self.war_exhaustion = 0.0
+                other.war_exhaustion = 0.0
+
+    def start_war(self, other):
+        if other.id not in self.at_war:
+            self.at_war.add(other.id)
+            other.at_war.add(self.id)
+            if DIPLOMACY_VERBOSITY:
+                print(f"🔥 ВОЙНА: государство {self.id} атакует {other.id}!")
+
+    def add_war_exhaustion(self):
+        if self.at_war:
+            self.war_exhaustion += WAR_EXHAUSTION_RATE
+            for enemy_id in list(self.at_war):
+                self.relations[enemy_id] = self.relations.get(enemy_id, 0.0) + 0.5
+
+    def get_border_cells(self):
+        border = set()
+        for (i, j) in self.territory:
+            border.add((i + 1, j))
+            border.add((i - 1, j))
+            border.add((i, j + 1))
+            border.add((i, j - 1))
+        return border
+
+    def maybe_vassalize(self, enemy):
+        if enemy.id in self.vassals or enemy.overlord_id == self.id:
+            return
+        if not enemy.territory or enemy.population <= 0:
+            return
+        if self.military_power <= 0:
+            return
+
+        enemy_power = enemy.military_power if enemy.military_power > 0 else enemy.population * 0.0001
+        power_ratio = self.military_power / max(1.0, enemy_power)
+        rel = self.relations.get(enemy.id, 0.0)
+
+        if power_ratio >= 2.0 and rel > VASSALIZATION_RELATION_FLOOR:
+            self.vassals.add(enemy.id)
+            enemy.overlord_id = self.id
+            enemy.vassal_loyalty = 1.0
+
+            self.at_war.discard(enemy.id)
+            enemy.at_war.discard(self.id)
+
+            self.relations[enemy.id] = max(self.relations.get(enemy.id, 0.0), 10.0)
+            enemy.relations[self.id] = self.relations[enemy.id]
+            if DIPLOMACY_VERBOSITY:
+                print(f"👑 Государство {enemy.id} стало вассалом государства {self.id}")
+
+    def attack_enemy_cells(self, world, states_by_id):
+        if not self.at_war:
+            return
+
+        border = self.get_border_cells()
+        if not border:
+            return
+
+        border_list = list(border)
+
+        for enemy_id in list(self.at_war):
+            enemy_state = states_by_id.get(enemy_id)
+            if not enemy_state or not enemy_state.territory:
+                continue
+
+            random.shuffle(border_list)
+            for pos in border_list:
+                if pos in enemy_state.territory:
+                    if random.random() < TERRITORY_STEAL_CHANCE:
+                        enemy_state.territory.remove(pos)
+                        self.territory.add(pos)
+
+                        # боевые потери (повлияют на демографию на следующем шаге)
+                        self.population = int(self.population * (1 - BATTLE_DAMAGE_RATE))
+                        enemy_state.population = int(enemy_state.population * (1 - BATTLE_DAMAGE_RATE))
+
+                        self.maybe_vassalize(enemy_state)
+                    break
+
+    # ===== Поглощение и макро-рост =====
 
     def absorb_entity(self, entity, world):
-        """Поглощает сущность при формировании ИЛИ мигрантов"""
         self.population += entity.population
-        # Технологии мигрантов ассимилируются (с бонусом)
         if entity.tech > self.tech:
-            self.tech = min(1.0, self.tech + (entity.tech - self.tech) * 0.1) 
-        
-        # Добавляем территорию, если это племя или город
+            self.tech = min(1.0, self.tech + (entity.tech - self.tech) * 0.1)
+
         if not isinstance(entity, HumanGroup):
-             self.territory.add((entity.i, entity.j))
-             if isinstance(entity, City):
-                 self.cities_coords.append((entity.i, entity.j))
-        
+            self.territory.add((entity.i, entity.j))
+            if isinstance(entity, City):
+                self.cities_coords.append((entity.i, entity.j))
+
         if not self.is_coastal:
             cell = world.get((entity.i, entity.j))
             if cell and cell.is_coastal:
@@ -785,57 +1110,42 @@ class State:
 
         entity.alive = False
 
+        # возрастную структуру пересобираем на следующем шаге
+        self.demography_initialized = False
+
     def get_expansion_candidates(self, world, all_claimed_cells, nx, ny):
-        """
-        Новая "умная" логика: находит и ОЦЕНИВАЕТ все
-        пограничные клетки по их "желанности".
-        """
-        candidates = {} # dict[coord, score]
-        
+        candidates = []
+
         if nx is None or ny is None:
-            return [] # Не можем работать без размеров карты
+            return []
 
         for (i, j) in self.territory:
-            # Проверяем 8 соседей (для "заполнения" дыр)
-            for di in range(-1, 2):
-                for dj in range(-1, 2):
-                    if di == 0 and dj == 0: continue
-                    
-                    check_pos = ((i + di) % nx, (j + dj) % ny)
-                    
-                    # 1. Кандидат?
-                    # - Не наша территория И не чужая
-                    if check_pos not in self.territory and check_pos not in all_claimed_cells:
-                        cell = world.get(check_pos)
-                        
-                        # 2. Это суша?
-                        if cell and cell.is_land:
-                            
-                            # 3. Оценка "желанности"
-                            score = candidates.get(check_pos, 0.0)
-                            
-                            # +1.0 за пригодность (базовая ценность)
-                            score += cell.habitability
-                            
-                            # +2.0 за плодородность (сельское хозяйство)
-                            score += cell.arable * 2.0 
-                            
-                            # +1.5 за побережье (торговля/флот)
-                            if cell.is_coastal:
-                                score += 1.5
-                                
-                            # +0.5 за *каждого* соседа, который УЖЕ наш
-                            # (!!!) ЭТО РЕАЛИЗУЕТ ТВОЙ ЗАПРОС "СОЕДИНИТЬ ТЕРРИТОРИИ"
-                            # Клетка- "дырка", окруженная 8-ю нашими,
-                            # получит +4.0 и будет захвачена в первую очередь.
-                            if (i, j) in self.territory:
-                                score += 0.5
-                                
-                            candidates[check_pos] = score
+            for di in (-1, 0, 1):
+                ni = i + di
+                for dj in (-1, 0, 1):
+                    if di == 0 and dj == 0:
+                        continue
+                    nj = j + dj
+                    pos = (ni % nx, nj % ny)
 
-        # Возвращаем отсортированный список: (оценка, (i, j))
-        sorted_candidates = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
-        return [(score, pos) for pos, score in sorted_candidates]
+                    if pos in self.territory or pos in all_claimed_cells:
+                        continue
+
+                    cell = world.get(pos)
+                    if not cell or not cell.is_land:
+                        continue
+
+                    score = (
+                        cell.habitability * 1.2 +
+                        cell.arable * 2.5 +
+                        (1.5 if cell.is_coastal else 0.0) +
+                        cell.food_availability * 1.3
+                    )
+
+                    candidates.append((score, pos))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates
 
     def step(self, world, debug=False):
         if not self.alive:
@@ -843,10 +1153,14 @@ class State:
         self.age += SIMULATION_STEP_YEARS
         new_entities = []
 
-        # 1. Макроэкономические показатели
+        # 1. Агрегированные характеристики территории
         total_habitability = 0.0
         total_food_prod = 0.0
         total_arable = 0.0
+        total_wood = 0.0
+        total_stone = 0.0
+        total_ore = 0.0
+
         for (i, j) in self.territory:
             cell = world.get((i, j))
             if not cell:
@@ -854,53 +1168,76 @@ class State:
             total_habitability += cell.habitability
             total_food_prod += (cell.arable + cell.food_availability)
             total_arable += cell.arable
+            props = cell.properties
+            total_wood += props.get("wood_yield", 0.0)
+            total_stone += props.get("stone_yield", 0.0)
+            total_ore += props.get("ore_yield", 0.0)
 
         n_cells = max(1, len(self.territory))
         avg_habitability = total_habitability / n_cells
         avg_arable = total_arable / n_cells
+        avg_wood = total_wood / n_cells
+        avg_stone = total_stone / n_cells
+        avg_ore = total_ore / n_cells
 
-        # 2. Производство еды и вместимость (ограничение роста)
+        # ёмкость среды (K)
         base_capacity = n_cells * avg_habitability * CARRYING_CAPACITY_FACTOR
         tech_capacity_multiplier = 1.0 + (self.tech * 4.0)
         effective_capacity = base_capacity * tech_capacity_multiplier
 
-        # Производство пищи — завиcит от ареала и технологий
-        # Учитываем богатство ресурсов: дерево, камень, руда
+        # производство еды
         resource_bonus = 1.0 + (
-            (total_arable / n_cells) * 0.4 +
-            (sum(world[(i, j)].properties.get("wood_yield", 0) for (i, j) in self.territory) / n_cells) * 0.2 +
-            (sum(world[(i, j)].properties.get("stone_yield", 0) for (i, j) in self.territory) / n_cells) * 0.2 +
-            (sum(world[(i, j)].properties.get("ore_yield", 0) for (i, j) in self.territory) / n_cells) * 0.3
+            avg_arable * 0.4 +
+            avg_wood * 0.2 +
+            avg_stone * 0.2 +
+            avg_ore * 0.3
         )
-        food_production = total_food_prod * (1 + self.tech) * MACRO_FOOD_PRODUCTION_FACTOR * n_cells * resource_bonus
+
+        food_production = (
+            total_food_prod *
+            (1 + self.tech) *
+            MACRO_FOOD_PRODUCTION_FACTOR *
+            n_cells *
+            resource_bonus
+        )
         food_needed = self.population * self.need_food_per_capita
         food_surplus_ratio = (food_production - food_needed) / (food_needed + 1e-9)
 
-        # 3. Демография с насыщением (логистическая модель)
-        growth_base = MACRO_BIRTH_RATE * (1 + avg_habitability * 0.5) * (1 + min(0.5, food_surplus_ratio))
-        death_base = MACRO_DEATH_RATE * (1 - avg_habitability * 0.5)
-        overpop_penalty = max(0.0, (self.population / (effective_capacity + 1e-9)) - 1.0) * 0.05
+        # Общественный строй, эпидемии и голод
+        self._update_society_type(n_cells, avg_habitability)
+        self._update_epidemic_and_famine(food_surplus_ratio, n_cells)
 
-        yearly_growth = growth_base - death_base - overpop_penalty
-        years = max(1, SIMULATION_STEP_YEARS)
-        growth_factor = (1.0 + yearly_growth) ** years
-        self.population = int(max(1, self.population * growth_factor))
+        # 2. Демографический шаг (убираем экспоненциальный рост)
+        self._demographic_step(SIMULATION_STEP_YEARS, effective_capacity, food_surplus_ratio)
+        if not self.alive:
+            return []
 
-        # 4. Рост технологий теперь тоже ограничен
-        tech_gain = (len(self.cities_coords) / 5) * (self.population / (effective_capacity + 1e-9)) * MACRO_TECH_FACTOR
+        # 3. Рост технологий (макро)
+        tech_gain = (
+            (len(self.cities_coords) / 5.0) *
+            (self.population / (effective_capacity + 1e-9)) *
+            MACRO_TECH_FACTOR
+        )
         self.tech = min(1.0, self.tech + tech_gain)
 
-        # 5. Расширение и морские колонии (оставляем как есть)
-        if self.is_coastal and self.tech > SEAFARING_TECH_THRESHOLD and random.random() < SEAFARING_SPAWN_CHANCE:
+        # 4. Морские колонии
+        if (
+            self.is_coastal and
+            self.tech > SEAFARING_TECH_THRESHOLD and
+            random.random() < SEAFARING_SPAWN_CHANCE
+        ):
             start_coord = random.choice(self.cities_coords) if self.cities_coords else (self.i, self.j)
             new_pop = random.randint(100, 300)
-            for di, dj in [(0,1),(0,-1),(1,0),(-1,0)]:
+            for di, dj in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 check_pos = (start_coord[0] + di, start_coord[1] + dj)
                 cell = world.get(check_pos)
                 if cell and not cell.is_land:
-                    self.population -= new_pop
+                    self.population = max(1, self.population - new_pop)
                     new_colonists = SeafaringGroup(
-                        random.randint(10000, 99999), *check_pos, new_pop, start_tech=self.tech * 0.7
+                        random.randint(10000, 99999),
+                        *check_pos,
+                        new_pop,
+                        start_tech=self.tech * 0.7
                     )
                     new_entities.append(new_colonists)
                     if debug:
@@ -908,165 +1245,288 @@ class State:
                     break
 
         if debug:
-            print(f"[STATE #{self.id}] Pop={self.population}, Cap={int(effective_capacity)}, "
-                f"Tech={self.tech:.3f}, Terr={len(self.territory)}, FoodΔ={food_surplus_ratio:+.2f}")
+            print(
+                f"[STATE #{self.id}] Pop={self.population}, K={int(effective_capacity)}, "
+                f"Tech={self.tech:.3f}, Terr={len(self.territory)}, FoodΔ={food_surplus_ratio:+.2f}, "
+                f"Soc={self.society_type}, FamineYears={self.years_of_famine:.0f}, Epi={self.epidemic_severity:.2f}"
+            )
 
         return new_entities
 
 
+# =======================================
+# === 7.5 ДИПЛОМАТИЧЕСКИЙ МЕНЕДЖЕР =====
+# =======================================
+
+class DiplomacyManager:
+    def __init__(self):
+        self.total_power = 0.0
+
+    def initialize_relations(self, states):
+        for s in states:
+            if not s.relations_initialized:
+                s.init_relations(states)
+                s.relations_initialized = True
+
+    def update_balance_of_power(self, states):
+        total_power = 0.0
+        for s in states:
+            territory_factor = max(1.0, len(s.territory))
+            s.military_power = (
+                s.population * 0.0001 * (1.0 + s.tech * 2.0) +
+                territory_factor * 0.5
+            )
+            total_power += s.military_power
+
+        self.total_power = total_power
+        if total_power <= 0:
+            for s in states:
+                s.is_great_power = False
+            return
+
+        sorted_states = sorted(states, key=lambda st: st.military_power, reverse=True)
+        top_k = max(1, len(sorted_states) // 4)
+        top_ids = {st.id for st in sorted_states[:top_k]}
+        for s in states:
+            s.is_great_power = s.id in top_ids
+
+    def handle_coalitions_and_vassals(self, states):
+        if not states or self.total_power <= 0:
+            return
+
+        id_to_state = {s.id: s for s in states}
+
+        hegemon = max(states, key=lambda s: s.military_power)
+        if hegemon.military_power / self.total_power < 0.35:
+            hegemon = None
+
+        if hegemon:
+            anti = [
+                s for s in states
+                if s.id != hegemon.id and s.relations.get(hegemon.id, 0.0) < 0.0
+            ]
+            for i in range(len(anti)):
+                for j in range(i + 1, len(anti)):
+                    a, b = anti[i], anti[j]
+                    a.allies.add(b.id)
+                    b.allies.add(a.id)
+
+        # Лояльность вассалов
+        for s in states:
+            if s.overlord_id is not None:
+                s.vassal_loyalty += 0.01 * (SIMULATION_STEP_YEARS / 10.0)
+                s.vassal_loyalty -= len(s.at_war) * VASSAL_WAR_LOYALTY_PENALTY * (SIMULATION_STEP_YEARS / 10.0)
+                s.vassal_loyalty = max(0.0, min(1.5, s.vassal_loyalty))
+
+                if s.vassal_loyalty < VASSAL_REVOLT_THRESHOLD:
+                    overlord = id_to_state.get(s.overlord_id)
+                    if overlord:
+                        overlord.vassals.discard(s.id)
+                        overlord.relations[s.id] = min(
+                            overlord.relations.get(s.id, 0.0),
+                            -15.0
+                        )
+                        s.relations[overlord.id] = -15.0
+                    s.overlord_id = None
+
+        # "Дань": небольшой перенос тех. от вассалов
+        for s in states:
+            if s.vassals:
+                for vid in list(s.vassals):
+                    v = id_to_state.get(vid)
+                    if not v:
+                        continue
+                    tribute = v.tech * VASSAL_TRIBUTE_RATE
+                    v.tech = max(0.0, v.tech - tribute * 0.3)
+                    s.tech = min(1.0, s.tech + tribute)
+
+    def update_diplomacy(self, states):
+        if len(states) < 2:
+            return
+
+        self.initialize_relations(states)
+        self.update_balance_of_power(states)
+
+        for s in states:
+            s.decay_relations()
+            s.add_war_exhaustion()
+
+        n = len(states)
+        for i in range(n):
+            a = states[i]
+            for j in range(i + 1, n):
+                b = states[j]
+                a.check_war_state(b)
+                b.check_war_state(a)
+                a.try_make_peace(b)
+                b.try_make_peace(a)
+
+        self.handle_coalitions_and_vassals(states)
+
+    def apply_war_actions(self, states, world):
+        states_by_id = {s.id: s for s in states}
+        for s in states:
+            if s.at_war:
+                s.attack_enemy_cells(world, states_by_id)
+
 
 # =======================================
-# === 8. СИМУЛЯЦИЯ (Изменена) ==========
+# === 8. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========
 # =======================================
 
 def distance(i1, j1, i2, j2):
-    """Простая дистанция (Чебышев) для расчета радиусов"""
     return max(abs(i1 - i2), abs(j1 - j2))
+
+
+# =======================================
+# === 9. СИМУЛЯЦИЯ ======================
+# =======================================
 
 class Simulation:
     def __init__(self, world_file="world_cells.json", nx=None, ny=None):
-        self.world = load_world(world_file, nx, ny) # <--- ИЗМЕНЕНО
+        self.world = load_world(world_file, nx, ny)
         self.entities = []
         self.year = START_YEAR
         self.running = True
-        self.occupied_cells = set() # Для оптимизации регенерации
-        self.nx = nx 
+        self.occupied_cells = set()
+        self.nx = nx
         self.ny = ny
+        self.diplomacy = DiplomacyManager()
 
     def initialize(self):
         start = HumanGroup(0, *STARTING_CELL_COORDS, STARTING_POPULATION)
         self.entities = [start]
 
     def regenerate_world(self):
-        """Регенерирует случайную часть пустых клеток (для FPS)"""
         all_cells_coords = list(self.world.keys())
         random.shuffle(all_cells_coords)
-        
+
         sample_size = int(len(all_cells_coords) * CELL_REGEN_TICK_RATE)
-        
-        for i in range(sample_size):
-            coord = all_cells_coords[i]
+        for idx in range(sample_size):
+            coord = all_cells_coords[idx]
             if coord not in self.occupied_cells:
                 self.world[coord].regenerate()
-    
+
     def resolve_interactions(self, debug=False):
-        """
-        НОВАЯ ФАЗА 3:
-        Находит клетки с >1 агентом и разрешает конфликты/слияния.
-        """
-        occupied_cells = {} # dict[coord, list[Entity]]
-        
-        # 1. Собрать всех, кто где стоит
+        occupied_cells = {}
+
         for e in self.entities:
-            if not e.alive: continue
+            if not e.alive:
+                continue
             occupied_cells.setdefault((e.i, e.j), []).append(e)
-            
-        # 2. Обработать "конфликтные" клетки
+
         for coord, occupants in occupied_cells.items():
             if len(occupants) <= 1:
                 continue
 
-            # --- Логика, кто "владелец" клетки ---
-            # 1. Гос-во > Город > Племя > Группа
-            # 2. Если равны - побеждает тот, у кого больше населения
-            
             def get_entity_priority(e):
-                if isinstance(e, State): return 4
-                if isinstance(e, City): return 3
-                if isinstance(e, Tribe): return 2
-                if isinstance(e, HumanGroup): return 1
+                if isinstance(e, State):
+                    return 4
+                if isinstance(e, City):
+                    return 3
+                if isinstance(e, Tribe):
+                    return 2
+                if isinstance(e, HumanGroup):
+                    return 1
                 return 0
-            
-            # Сортируем: самый "сильный" будет первым
-            occupants.sort(key=lambda e: (get_entity_priority(e), e.population), reverse=True)
-            
+
+            occupants.sort(
+                key=lambda e: (get_entity_priority(e), e.population),
+                reverse=True
+            )
+
             owner = occupants[0]
             losers = occupants[1:]
-            
-            if debug and losers:
-                print(f"  [Интеракция] В клетке {coord}: {owner.stage} #{owner.id} (Pop: {owner.population}) 'победил' {len(losers)} других агентов.")
 
-            # 3. "Владелец" поглощает всех остальных
+            if debug and losers:
+                print(
+                    f"  [Интеракция] В клетке {coord}: {owner.stage} #{owner.id} "
+                    f"(Pop: {owner.population}) 'победил' {len(losers)} других агентов."
+                )
+
             for loser in losers:
-                # В State и City своя логика поглощения, в Tribe/Group - общая
-                if isinstance(owner, State) or isinstance(owner, City):
-                    owner.absorb_entity(loser, self.world) if isinstance(owner, State) else owner.absorb(loser)
-                elif hasattr(owner, 'absorb'):
+                if isinstance(owner, State):
+                    owner.absorb_entity(loser, self.world)
+                elif isinstance(owner, City):
+                    owner.absorb(loser)
+                elif hasattr(owner, "absorb"):
                     owner.absorb(loser)
                 else:
-                    # На всякий случай, если у "владельца" нет .absorb 
-                    # (например, SeafaringGroup - хотя он не должен быть на суше)
-                    loser.alive = False 
-                
-                # Если "владелец" - это Группа, она прекращает миграцию
+                    loser.alive = False
+
                 if isinstance(owner, HumanGroup):
                     owner.is_migrating = False
 
     def step_aggregation(self, debug=False):
-        """Фаза агрегации: Города поглощают Племена, Города становятся Государствами"""
-        
-        # Разделяем для удобства (но работаем с self.entities)
         cities = [e for e in self.entities if isinstance(e, City) and e.alive]
         tribes = [e for e in self.entities if isinstance(e, Tribe) and e.alive]
         states = [e for e in self.entities if isinstance(e, State) and e.alive]
-        
+
         new_states = []
         entities_to_remove = set()
 
-        # 1. Города поглощают Племена
+        # Города поглощают племена
         for city in cities:
-            if city in entities_to_remove: continue
+            if city in entities_to_remove:
+                continue
             for tribe in tribes:
-                if tribe in entities_to_remove: continue
+                if tribe in entities_to_remove:
+                    continue
                 if distance(city.i, city.j, tribe.i, tribe.j) <= city.influence_radius:
                     city.absorb(tribe)
                     entities_to_remove.add(tribe)
 
-        # 2. Города (и племена) поглощаются существующими Государствами
+        # Города и племена поглощаются существующими гос-вами
         for state in states:
             for entity in (cities + tribes):
-                if entity in entities_to_remove: continue
-                # Проверяем, находится ли агент на территории гос-ва (грубо)
+                if entity in entities_to_remove:
+                    continue
                 if (entity.i, entity.j) in state.territory:
-                     state.absorb_entity(entity, self.world)
-                     entities_to_remove.add(entity)
-                     continue
-                # Проверяем, не вошел ли он в радиус столицы (грубо)
+                    state.absorb_entity(entity, self.world)
+                    entities_to_remove.add(entity)
+                    continue
                 if distance(state.i, state.j, entity.i, entity.j) <= STATE_INFLUENCE_RADIUS:
                     state.absorb_entity(entity, self.world)
                     entities_to_remove.add(entity)
 
-        # 3. Города формируют новые Государства
-        eligible_cities = [c for c in cities if c.population > STATE_FOUNDING_POP and c.tech > STATE_FOUNDING_TECH and c not in entities_to_remove]
-        
+        # Города формируют новые гос-ва
+        eligible_cities = [
+            c for c in cities
+            if (
+                c.population > STATE_FOUNDING_POP and
+                c.tech > STATE_FOUNDING_TECH and
+                c not in entities_to_remove
+            )
+        ]
+
         for city in eligible_cities:
-            if city in entities_to_remove: continue
-            
+            if city in entities_to_remove:
+                continue
+
             if debug:
                 print(f"  [Эволюция] Город #{city.id} ({city.i},{city.j}) основывает ГОСУДАРСТВО!")
-            
-            # 1. Создаем новое Государство
+
             new_state = State(city.id, city.i, city.j, 0, city.tech)
             entities_to_remove.add(city)
-            
-            # 2. Поглощаем всех в радиусе
-            entities_to_absorb = [e for e in self.entities if isinstance(e, (Tribe, City)) and e.alive and e not in entities_to_remove]
-            
+
+            entities_to_absorb = [
+                e for e in self.entities
+                if isinstance(e, (Tribe, City)) and e.alive and e not in entities_to_remove
+            ]
+
             for entity in entities_to_absorb:
                 if distance(city.i, city.j, entity.i, entity.j) <= STATE_INFLUENCE_RADIUS:
                     new_state.absorb_entity(entity, self.world)
                     entities_to_remove.add(entity)
-            
-            # Если столица не поглотилась (редко, но бывает), добавляем ее
+
             if (city.i, city.j) not in new_state.territory:
-                 new_state.absorb_entity(city, self.world) # city уже в entities_to_remove
+                new_state.absorb_entity(city, self.world)
 
             new_states.append(new_state)
 
-        # Применяем изменения
         if new_states:
             self.entities.extend(new_states)
-        
+
         if entities_to_remove:
             self.entities = [e for e in self.entities if e not in entities_to_remove]
 
@@ -1074,96 +1534,83 @@ class Simulation:
         if not self.running or not self.entities:
             self.running = False
             return self.entities, self.year
-            
+
         self.year += SIMULATION_STEP_YEARS
         new_entities = []
         entities_to_remove = set()
-        move_requests = [] # <--- НОВОЕ: список для заявок на ход
-        
-        self.occupied_cells = {e.i: e.j for e in self.entities if e.alive and isinstance(e, BaseEntity)}
-        
-        # 1. Шаг регенерации мира
+        move_requests = []
+
+        self.occupied_cells = {
+            (e.i, e.j)
+            for e in self.entities
+            if e.alive and isinstance(e, BaseEntity)
+        }
+
+        # 1. Регенерация мира
         self.regenerate_world()
 
-        # ===============================================
-        # === ФАЗА 1: ЛОГИКА И ЗАЯВКИ НА ХОД ==========
-        # ===============================================
+        # 2. Логика агентов
         for e in list(self.entities):
             if not e.alive:
                 entities_to_remove.add(e)
                 continue
-            
-            # Логика "Сна"
+
             if isinstance(e, BaseEntity) and e.sleep_timer > 0:
                 e.sleep_timer -= 1
                 continue
-            
-            # Шаг для Макро-Агентов (Государств)
+
             if isinstance(e, State):
                 results = e.step(self.world, debug=debug)
                 if results:
                     new_entities.extend(results)
-            
-            # Шаг для Базовых Агентов
             elif isinstance(e, BaseEntity):
                 cell = self.world.get((e.i, e.j))
                 if not cell:
                     e.alive = False
                     entities_to_remove.add(e)
                     continue
-                
-                # VVV Убираем entity_map из сигнатуры VVV
-                result = e.step(cell, self.world, debug=debug) 
-                
+
+                result = e.step(cell, self.world, debug=debug)
                 if result:
                     new_entities.append(result)
-                
-                # VVV НОВЫЙ БЛОК: Собираем "заявки на ход" VVV
+
                 if isinstance(e, HumanGroup) and e.next_pos:
                     move_requests.append(e)
 
-        # 3. Применяем добавление/удаление
         if new_entities:
             self.entities.extend(new_entities)
-        
+
         if entities_to_remove:
             self.entities = [e for e in self.entities if e not in entities_to_remove]
-        
-        # ===============================================
-        # === ФАЗА 2: ДВИЖЕНИЕ ==========================
-        # ===============================================
+
+        # 3. Движение групп
         for group in move_requests:
-            if group.alive: # Мог умереть в Фазе 1
+            if group.alive:
                 group.move_to(*group.next_pos)
-                
-                # VVV ДОБАВИТЬ ЭТИ 3 СТРОКИ VVV
                 group.path.append(group.next_pos)
                 if len(group.path) > 100:
                     group.path.pop(0)
-                
                 group.next_pos = None
 
-        # ===============================================
-        # === ФАЗА 3: РАЗРЕШЕНИЕ ИНТЕРАКЦИЙ ===========
-        # ===============================================
-        # (Проверяем, только если были движения)
+        # 4. Столкновения
         if move_requests:
-             self.resolve_interactions(debug=debug)
+            self.resolve_interactions(debug=debug)
 
-        # 4. Фаза Агрегации (Города -> Гос-ва)
+        # 5. Агрегация (города, гос-ва)
         self.step_aggregation(debug=debug)
-        
-        # === ФАЗА 4.5: Реалистичное расширение стран ===
 
-        # 1. Собираем все занятые гос-вами клетки
-        all_claimed_cells = set()
+        # 6. Дипломатия и войны
         states = [e for e in self.entities if isinstance(e, State)]
+        if states:
+            self.diplomacy.update_diplomacy(states)
+            self.diplomacy.apply_war_actions(states, self.world)
+
+        # 7. Расширение территорий
+        all_claimed_cells = set()
         for s in states:
             all_claimed_cells.update(s.territory)
 
-        # 2. Каждый штат накапливает "бюджет" и тратит его
         for s in states:
-            # --- Вычисляем средние характеристики территории ---
             total_habitability = 0.0
             total_food = 0.0
             total_arable = 0.0
@@ -1181,76 +1628,66 @@ class Simulation:
             avg_food = total_food / total_cells
             avg_arable = total_arable / total_cells
 
-            # --- Определяем ресурсный коэффициент ---
-            avg_resource = (avg_food + avg_arable + avg_habit) / 3
-            resource_factor = max(0.1, avg_resource)  # чем беднее территория, тем меньше прирост влияния
+            avg_resource = (avg_food + avg_arable + avg_habit) / 3.0
+            resource_factor = max(0.1, avg_resource)
 
-            # --- Начисляем очки расширения ---
-            s.expansion_budget += ((s.population / 300_000.0) + (s.tech * 0.8)) * resource_factor
+            s.expansion_budget += ((s.population / 120_000.0) + (s.tech * 1.5)) * resource_factor
 
-            # --- Получаем список лучших кандидатов ---
             candidates = s.get_expansion_candidates(self.world, all_claimed_cells, self.nx, self.ny)
 
-            # --- Захватываем клетки, пока хватает бюджета ---
-            while s.expansion_budget >= 1.0 and candidates:
+            while s.expansion_budget >= 0.75 and candidates:
                 best_score, best_pos = candidates.pop(0)
                 s.territory.add(best_pos)
                 all_claimed_cells.add(best_pos)
-                s.expansion_budget -= 1.0
+                s.expansion_budget -= 0.75
 
-                # Проверяем, стала ли страна прибрежной
                 if not s.is_coastal:
                     cell = self.world.get(best_pos)
                     if cell and cell.is_coastal:
                         s.is_coastal = True
-             
-        # 5. Очистка мертвых
+
+        # 8. Очистка мертвых
         self.entities = [e for e in self.entities if e.alive]
-        
+
         if not self.entities:
             self.running = False
-
-        # Ускорение прогресса
-        if self.year > -10000:
-            BIRTH_RATE_BASE = 0.0005
-            TECH_DISCOVERY_CHANCE_BASE = 0.00008
-            CARRYING_CAPACITY_FACTOR = 150
-            for e in self.entities:
-                if isinstance(e, BaseEntity):
-                    e.tech += 0.0005
-        if self.year > -5000:
-            STATE_FOUNDING_TECH = 0.4
-            STATE_FOUNDING_POP = 80000
 
         return self.entities, self.year
 
 
 # =======================================
-# === 9. ТЕСТ ===========================
+# === 10. ТЕСТ ЗАПУСКА ==================
 # =======================================
 
 if __name__ == "__main__":
     sim = Simulation()
     sim.initialize()
-    for i in range(1000): # Увеличим время симуляции
-        entities, year = sim.step(debug=False) # Выключаем debug для скорости
-        
-        # Печатаем сводку каждые 100 лет
+    for i in range(1000):
+        entities, year = sim.step(debug=False)
+
         if i % 10 == 0:
             counts = {"Group": 0, "Tribe": 0, "City": 0, "Seafaring": 0, "State": 0}
             total_pop = 0
+            techs = []
             for e in entities:
                 counts[e.stage.capitalize()] += 1
-                total_pop += e.population
-            
+                if hasattr(e, "population"):
+                    total_pop += e.population
+                if hasattr(e, "tech"):
+                    techs.append(e.tech)
+
             print(f"--- Год: {year} | Агентов: {len(entities)} | Всего населения: {total_pop} ---")
-            print(f'Население: {max([e.population for e in entities])}, средний: {sum([e.population for e in entities]) / len(entities)}')
-            print(f'Технологии: {max([e.tech for e in entities])}, средний: {sum([e.tech for e in entities]) / len(entities)}')
+            if counts["City"]:
+                print(f"  Городов: {counts['City']}")
+            if counts["State"]:
+                print(f"  Государств: {counts['State']}")
+            if techs:
+                print(f"  Тех: макс={max(techs):.3f}, ср={sum(techs)/len(techs):.3f}")
             print(f"    {counts}")
-            
+
             if not entities:
                 print("Симуляция завершена: все вымерли.")
                 break
-    
+
     print("Финальный отчет:")
     print(f"{year}: {entities}")
