@@ -62,8 +62,8 @@ MIGRATION_STRESS_THRESHOLD = 1.2  # prevents excessive splitting
 
 TRIBE_FOUNDING_THRESHOLD = 500
 CITY_FOUNDING_THRESHOLD = 5000    # earlier city formation ≈ −15000
-STATE_FOUNDING_POP = 30000
-STATE_FOUNDING_TECH = 0.30        # calibrated for ≈ −10000 appearance
+STATE_FOUNDING_POP = 25000
+STATE_FOUNDING_TECH = 0.25       # calibrated for ≈ −10000 appearance
 
 
 # ============================
@@ -71,7 +71,7 @@ STATE_FOUNDING_TECH = 0.30        # calibrated for ≈ −10000 appearance
 # ============================
 
 # per-step discovery chance (adjusted to produce tech ≈ 0.1 by −15000)
-TECH_DISCOVERY_CHANCE_BASE = 0.005
+TECH_DISCOVERY_CHANCE_BASE = 0.01
 
 # influence of population density
 TECH_DENSITY_FACTOR = 0.7
@@ -135,7 +135,7 @@ MACRO_DEATH_RATE = 0.009
 DIPLOMACY_VERBOSITY = True
 
 RELATION_DECAY = 0.4                # slower relation decay
-WAR_THRESHOLD = -50.0               # hostile threshold
+WAR_THRESHOLD = -25.0               # hostile threshold
 PEACE_THRESHOLD = 0.0
 ALLIANCE_THRESHOLD = 60.0
 BASE_AGGRESSION = 0.05

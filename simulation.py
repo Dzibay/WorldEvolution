@@ -608,20 +608,20 @@ class SeafaringGroup(BaseEntity):
         super().__init__(entity_id, i, j, population, start_tech)
         self.stage = "seafaring"
         self.food = SEAFARING_FOOD_START * (population / 50)
-        self.water = 0.9
-        self.need_food_per_capita = 0.003
-        self.steps_at_sea = 0
-        self.ignore_land_steps = 8
-        self.direction = random.choice([
-            (1, 0), (-1, 0), (0, 1), (0, -1),
-            (1, 1), (-1, -1), (1, -1), (-1, 1)
-        ])
-        self.origin_land = (i, j)      # чтобы понимать, куда не возвращаться
-        self.ignore_land_steps = 15     # чтобы оторваться от родного берега
-        self.ocean_age = 0              # сколько ходов в океане
-        self.direction = random.choice([(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)])
-        self.last_direction = self.direction
-
+        self.water = 1.0  # Start fully hydrated
+        self.need_food_per_capita = 0.001  # Lower food need at sea (fishing logic implied)
+        
+        self.origin_land = (i, j)
+        self.ocean_age = 0
+        
+        # Initial push away from land
+        dx = random.choice([-1, 0, 1])
+        dy = random.choice([-1, 0, 1])
+        if dx == 0 and dy == 0: dx = 1
+        self.direction = (dx, dy) 
+        
+        # Исправление 3: Более высокая инерция направления
+        self.inertia_counter = 0 
 
     def dist_from_origin(self, x=None, y=None):
         if x is None: x = self.i
@@ -629,148 +629,140 @@ class SeafaringGroup(BaseEntity):
         ox, oy = self.origin_land
         return max(abs(x - ox), abs(y - oy))
 
-
     def update_population_seafaring(self):
         if not self.alive:
             return
+        
+        # Смертность в море ниже, чтобы дать шанс доплыть
+        base_death = 0.005 
+        starvation_term = self.hunger_level * 0.05
+        dehydration_term = self.thirst_level * 0.05
 
-        yearly_birth = DEATH_RATE_BASE
-        yearly_death = DEATH_RATE_BASE
-
-        starvation_term = self.hunger_level * DEATH_RATE_STARVATION
-        dehydration_term = self.thirst_level * (DEATH_RATE_STARVATION * 0.5)
-
-        years = max(1, SIMULATION_STEP_YEARS)
-
-        base_rate = 1.0 + yearly_birth - (yearly_death + starvation_term + dehydration_term)
-        clamped_base_rate = max(0.0, base_rate)
-        growth_factor = clamped_base_rate ** years
-
+        yearly_death = base_death + starvation_term + dehydration_term
+        
+        # Population declines slowly at sea unless starving
+        growth_factor = (1.0 - yearly_death) ** SIMULATION_STEP_YEARS
         self.population = int(max(0, math.floor(self.population * growth_factor)))
 
         if self.population <= 0:
             self.alive = False
 
     def gather_resources(self, cell):
-        self.food += cell.properties.get("food_animal", 0) * self.population * 0.0005
-        self.water = max(0.0, self.water - 0.05)
+        # Рыбалка дает немного еды и чуть-чуть воды (дождь/рыба)
+        fish_food = cell.properties.get("food_animal", 0) * self.population * 0.002
+        self.food += fish_food
+        
+        # Исправление 1: Ресурсы тратятся намного медленнее или восполняются
+        # Шанс дождя или опреснения примитивными методами/рыбой
+        self.water = max(0.0, self.water - 0.008) # Хватит на ~120 ходов (1200 лет) без пополнения
+        if random.random() < 0.2: # Rain
+            self.water = min(1.0, self.water + 0.1)
 
-    def choose_next_direction(self, world):
-        self.ocean_age += 1
-        current_dist = self.dist_from_origin()
-
-        # 1. Первые шаги — ИГНОРИРУЕМ сушу, чтобы оторваться от материка
-        if self.ocean_age <= self.ignore_land_steps:
-            nx = self.i + self.direction[0]
-            ny = self.j + self.direction[1]
-            cell = world.get((nx, ny))
-            if cell and not cell.is_land:
-                self.last_direction = self.direction
-                return (nx, ny)
-
-        # 2. Радиус поиска суши (растёт с технологией)
+    def scan_for_land(self, world):
+        """Сканирует окрестности на наличие земли."""
+        # Радиус растет с технологиями
         radius = 2
-        if self.tech >= 0.2:
-            radius = 6
-        if self.tech >= 0.35:
-            radius = 12
-        if self.tech >= 0.45:
-            radius = 20  # РЕАЛЬНОЕ океанское исследование
+        if self.tech >= 0.2: radius = 5
+        if self.tech >= 0.4: radius = 10
+        if self.tech >= 0.6: radius = 15
 
-        # 3. Ищем сушу, но с учётом расстояния от материка
         best_target = None
         best_score = -999
 
         for r in range(1, radius + 1):
+            # Optimisation: check perimeter of square radius
             for dx in range(-r, r + 1):
                 for dy in range(-r, r + 1):
-                    if dx == 0 and dy == 0:
+                    # Check only the ring (perimeter)
+                    if abs(dx) != r and abs(dy) != r:
                         continue
-
-                    tx = self.i + dx
-                    ty = self.j + dy
+                        
+                    tx, ty = self.i + dx, self.j + dy
                     cell = world.get((tx, ty))
 
-                    if not cell or not cell.is_land:
-                        continue
+                    if cell and cell.is_land:
+                        dist_origin = self.dist_from_origin(tx, ty)
+                        
+                        # Исправление 2: ЛОГИКА ВЫСАДКИ
+                        # Запрещаем высаживаться только если мы ВЕРНУЛИСЬ к месту старта (ближе 15 клеток)
+                        if dist_origin < 15:
+                            continue
 
-                    # шаг в сторону суши
-                    step_x = self.i + (1 if dx > 0 else -1 if dx < 0 else 0)
-                    step_y = self.j + (1 if dy > 0 else -1 if dy < 0 else 0)
-
-                    # если суша — родная → отвергаем
-                    if self.dist_from_origin(step_x, step_y) < current_dist + 12:
-                        continue
-
-                    # оценка
-                    score = -r * 0.2 + self.dist_from_origin(step_x, step_y) * 0.5
-
-                    if score > best_score:
-                        best_score = score
-                        best_target = (step_x, step_y)
-
-        # 4. Если сушу нашли
-        if best_target and random.random() < 0.85:
-            dx = best_target[0] - self.i
-            dy = best_target[1] - self.j
-            self.direction = (dx, dy)
-            self.last_direction = self.direction
-            return best_target
-
-        # 5. Глубокий океан — сохраняем курс
-        if random.random() < 0.1:
-            # небольшая случайность
-            dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
-            self.direction = random.choice(dirs)
-
-        nx = self.i + self.direction[0]
-        ny = self.j + self.direction[1]
-        cell = world.get((nx, ny))
-
-        if cell and not cell.is_land:
-            self.last_direction = self.direction
-            return (nx, ny)
-
-        # fallback
-        dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(1,1),(-1,-1)]
-        random.shuffle(dirs)
-        for dx, dy in dirs:
-            nx = self.i + dx
-            ny = self.j + dy
-            cell = world.get((nx, ny))
-            if cell and not cell.is_land:
-                self.direction = (dx, dy)
-                self.last_direction = (dx, dy)
-                return (nx, ny)
-
-        return None
-
+                        # Оценка: чем ближе, тем лучше. Бонус за новые земли (далеко от дома)
+                        score = -r + (dist_origin * 0.1) 
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_target = (tx, ty)
+        return best_target
 
     def step(self, cell, world, debug=False):
-        if not self.alive:
-            return None
-
-        if cell.is_land:
-            self.alive = False
-            if debug:
-                print(f"  [Колонизация] Группа #{self.id} высадилась в ({self.i},{self.j})!")
-            return HumanGroup(self.id, self.i, self.j, self.population, self.tech)
+        if not self.alive: return None
 
         self.age += SIMULATION_STEP_YEARS
         self.gather_resources(cell)
-        self.consume_resources(cell)
+        self.consume_resources(cell) # Note: consume reduces water too
         self.update_population_seafaring()
-
+        
         if not self.alive:
-            if debug:
-                print(f"  [Потеря] Группа #{self.id} погибла в океане.")
+            if debug: print(f"☠ Группа #{self.id} погибла в море.")
             return None
 
-        new_pos = self.choose_next_direction(world)
-        if new_pos:
-            self.move_to(*new_pos)
-        else:
-            self.alive = False
+        # Исправление 1 (Главное): Скорость
+        # Корабли делают несколько "микро-шагов" за один ход симуляции (10 лет).
+        # Это позволяет переплыть океан за разумное время.
+        MOVES_PER_STEP = 4 
+        
+        for _ in range(MOVES_PER_STEP):
+            
+            # 1. Сначала ищем землю
+            land_target = self.scan_for_land(world)
+            
+            if land_target:
+                # Если видим землю - идем прямо к ней
+                lx, ly = land_target
+                dx = 1 if lx > self.i else -1 if lx < self.i else 0
+                dy = 1 if ly > self.j else -1 if ly < self.j else 0
+                self.direction = (dx, dy)
+                self.inertia_counter = 10 # Фиксируем курс на землю
+            else:
+                # 2. Если земли нет - плывем по инерции или дрейфуем
+                if self.inertia_counter > 0:
+                    self.inertia_counter -= 1
+                else:
+                    # Редкий шанс сменить курс (Дрейф)
+                    if random.random() < 0.02: # Было 0.1 (слишком часто)
+                        dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+                        # Предпочтение сохранению общего направления (не разворачиваться на 180)
+                        current_dx, current_dy = self.direction
+                        valid_dirs = [d for d in dirs if d[0]*current_dx + d[1]*current_dy >= 0]
+                        if valid_dirs:
+                            self.direction = random.choice(valid_dirs)
+                        self.inertia_counter = random.randint(5, 20)
+
+            # Выполняем движение
+            nx = self.i + self.direction[0]
+            ny = self.j + self.direction[1]
+            
+            # Проверка границ мира (цикличный мир по X, стена по Y)
+            # В load_world нет явного nx/ny в объекте cell, но обычно мир зациклен.
+            # Предположим, что словарь world обрабатывает координаты или возвращает None.
+            target_cell = world.get((nx, ny))
+            
+            if target_cell:
+                if target_cell.is_land:
+                    # LAND HO!
+                    self.alive = False
+                    if debug:
+                        print(f"⚓ [КОЛОНИЗАЦИЯ] Группа #{self.id} (Pop: {self.population}) открыла НОВЫЙ СВЕТ в ({nx},{ny})! Dist: {self.dist_from_origin(nx, ny)}")
+                    return HumanGroup(self.id, nx, ny, self.population, self.tech)
+                else:
+                    # Просто вода, плывем дальше
+                    self.move_to(nx, ny)
+            else:
+                # Край карты (если не зациклена) - "отскакиваем"
+                self.direction = (-self.direction[0], -self.direction[1])
+                self.inertia_counter = 5
 
         return None
 
@@ -1019,8 +1011,6 @@ class State:
         if other.id not in self.at_war:
             self.at_war.add(other.id)
             other.at_war.add(self.id)
-            if DIPLOMACY_VERBOSITY:
-                print(f"🔥 ВОЙНА: государство {self.id} атакует {other.id}!")
 
     def add_war_exhaustion(self):
         if self.at_war:
@@ -1059,8 +1049,6 @@ class State:
 
             self.relations[enemy.id] = max(self.relations.get(enemy.id, 0.0), 10.0)
             enemy.relations[self.id] = self.relations[enemy.id]
-            if DIPLOMACY_VERBOSITY:
-                print(f"👑 Государство {enemy.id} стало вассалом государства {self.id}")
 
     def attack_enemy_cells(self, world, states_by_id):
         if not self.at_war:
@@ -1114,38 +1102,92 @@ class State:
         self.demography_initialized = False
 
     def get_expansion_candidates(self, world, all_claimed_cells, nx, ny):
-        candidates = []
-
         if nx is None or ny is None:
             return []
 
+        # Кандидаты: словарь {координата: {ortho_neighbors: int, diag_neighbors: int}}
+        # ortho - соседи по сторонам (верх, низ, лево, право) - ЭТО ВАЖНО
+        # diag - соседи по углам - ЭТО МЕНЕЕ ВАЖНО
+        candidates_info = {}
+
+        # 1. Сканируем ТОЛЬКО границы нашей территории
         for (i, j) in self.territory:
-            for di in (-1, 0, 1):
-                ni = i + di
-                for dj in (-1, 0, 1):
-                    if di == 0 and dj == 0:
-                        continue
-                    nj = j + dj
-                    pos = (ni % nx, nj % ny)
-
-                    if pos in self.territory or pos in all_claimed_cells:
-                        continue
-
-                    cell = world.get(pos)
-                    if not cell or not cell.is_land:
+            # Проверяем 8 соседей
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0: continue
+                    
+                    ni, nj = (i + dx) % nx, (j + dy) % ny # Цикличный мир
+                    
+                    if (ni, nj) in self.territory or (ni, nj) in all_claimed_cells:
                         continue
 
-                    score = (
-                        cell.habitability * 1.2 +
-                        cell.arable * 2.5 +
-                        (1.5 if cell.is_coastal else 0.0) +
-                        cell.food_availability * 1.3
-                    )
+                    # Если этой клетки еще нет в кандидатах - создаем
+                    if (ni, nj) not in candidates_info:
+                        candidates_info[(ni, nj)] = {"ortho": 0, "diag": 0}
 
-                    candidates.append((score, pos))
+                    # Считаем тип соседства
+                    # Если dx*dy == 0 (один из них 0), значит это ортогональный сосед (крестом)
+                    if dx * dy == 0:
+                        candidates_info[(ni, nj)]["ortho"] += 1
+                    else:
+                        candidates_info[(ni, nj)]["diag"] += 1
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates
+        final_candidates = []
+
+        # 2. Оцениваем кандидатов
+        for pos, info in candidates_info.items():
+            cell = world.get(pos)
+            if not cell or not cell.is_land:
+                continue
+
+            # ❗ 1. Главное исправление — убираем диагональные захваты
+            # Клетка должна иметь хотя бы ОДНО прямое (ортогональное) соприкосновение
+            if info["ortho"] == 0:
+                continue
+
+            ortho = info["ortho"]
+            diag = info["diag"]
+
+            if info["diag"] >= 4:
+                continue
+
+            # 2. Базовая ценность клеток
+            base_score = (
+                cell.habitability * 5.0 +
+                cell.arable * 2.0 +
+                cell.food_availability * 1.0
+            )
+
+            # 3. Геометрический бонус — чтобы заливать дырки и делать границы ровными
+            if ortho >= 4:
+                shape_modifier = 100
+            elif ortho == 3:
+                shape_modifier = 25
+            elif ortho == 2:
+                shape_modifier = 6
+            elif ortho == 1:
+                shape_modifier = 1
+            else:
+                # бесполезно, даже не рассматривать — но мы уже отфильтровали ortho==0
+                shape_modifier = 0.1
+
+
+            # 4. Штраф за удалённость от столицы
+            dx = abs(pos[0] - self.i)
+            dy = abs(pos[1] - self.j)
+            if dx > nx // 2: dx = nx - dx
+
+            dist_sq = dx*dx + dy*dy
+            distance_penalty = 100.0 / (100.0 + dist_sq)
+
+            final_score = base_score * shape_modifier * distance_penalty
+
+            final_candidates.append((final_score, pos))
+
+        final_candidates.sort(key=lambda x: x[0], reverse=True)
+        return final_candidates
+
 
     def step(self, world, debug=False):
         if not self.alive:
@@ -1350,6 +1392,21 @@ class DiplomacyManager:
         for s in states:
             s.decay_relations()
             s.add_war_exhaustion()
+            
+            # Добавляем "Естественную напряженность" и случайные обиды
+            for other_id in list(s.relations.keys()):
+                # 1. Случайное падение отношений (интриги, оскорбления)
+                if random.random() < 0.1:
+                    s.relations[other_id] -= random.uniform(1.0, 5.0)
+                
+                # 2. Если государство-сосед слишком сильное — мы его боимся/ненавидим
+                # (упрощенная проверка, т.к. полная карта соседей сложна для расчета каждый ход)
+                other_state = next((x for x in states if x.id == other_id), None)
+                if other_state:
+                    dist = distance(s.i, s.j, other_state.i, other_state.j)
+                    # Если столицы близко (менее 30 клеток), считаем их соседями -> трение
+                    if dist < 30: 
+                        s.relations[other_id] -= 1.5  # Ежегодное ухудшение отношений с соседями
 
         n = len(states)
         for i in range(n):
@@ -1530,6 +1587,28 @@ class Simulation:
         if entities_to_remove:
             self.entities = [e for e in self.entities if e not in entities_to_remove]
 
+    def smooth_territory(self, territory, nx, ny):
+        territory_set = set(territory)
+        new_territory = set()
+
+        for i, j in territory_set:
+            ortho = 0
+            diag = 0
+
+            for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                if ((i+dx) % nx, (j+dy) % ny) in territory_set:
+                    ortho += 1
+
+            for dx, dy in ((1,1),(1,-1),(-1,1),(-1,-1)):
+                if ((i+dx) % nx, (j+dy) % ny) in territory_set:
+                    diag += 1
+
+            # Условие сглаживания
+            if ortho >= 2 or (ortho == 1 and diag >= 2):
+                new_territory.add((i, j))
+
+        return new_territory
+
     def step(self, debug=False):
         if not self.running or not self.entities:
             self.running = False
@@ -1628,23 +1707,40 @@ class Simulation:
             avg_food = total_food / total_cells
             avg_arable = total_arable / total_cells
 
-            avg_resource = (avg_food + avg_arable + avg_habit) / 3.0
+            avg_resource = (avg_food + avg_arable + avg_habit)
             resource_factor = max(0.1, avg_resource)
 
-            s.expansion_budget += ((s.population / 120_000.0) + (s.tech * 1.5)) * resource_factor
+            # 1. Базовое значение (государство всегда немного расширяется)
+            base_expansion = 0.7 
+            # 2. Делитель уменьшен с 120к до 10к, чтобы население влияло сильнее
+            pop_factor = s.population / 80_000.0 
+            
+            s.expansion_budget += (base_expansion + pop_factor + (s.tech * 2.0)) * resource_factor
 
             candidates = s.get_expansion_candidates(self.world, all_claimed_cells, self.nx, self.ny)
 
-            while s.expansion_budget >= 0.75 and candidates:
-                best_score, best_pos = candidates.pop(0)
-                s.territory.add(best_pos)
-                all_claimed_cells.add(best_pos)
-                s.expansion_budget -= 0.75
+            while s.expansion_budget >= 1.0:
+                candidates = s.get_expansion_candidates(self.world, all_claimed_cells, self.nx, self.ny)
+
+                if not candidates:
+                    break
+
+                _, pos = candidates[0]
+
+                s.territory.add(pos)
+                all_claimed_cells.add(pos)
+                s.expansion_budget -= 1.0
 
                 if not s.is_coastal:
-                    cell = self.world.get(best_pos)
+                    cell = self.world.get(pos)
                     if cell and cell.is_coastal:
                         s.is_coastal = True
+
+            # Сглаживание территории
+            s.territory = self.smooth_territory(s.territory, self.nx, self.ny)
+            all_claimed_cells.update(s.territory)
+
+
 
         # 8. Очистка мертвых
         self.entities = [e for e in self.entities if e.alive]
